@@ -41,6 +41,28 @@ func handlePWD(args []string) (string , error) {
 	return dir,nil
 }
 
+func handleCD(args []string) (error) {
+	if args[1] == "~" {
+		homePath := os.Getenv("HOME")
+		err := os.Chdir(homePath)
+		if errors.Is(err,fs.ErrNotExist) {
+			return fmt.Errorf("cd: %s: No such home directory",homePath)
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		err := os.Chdir(args[1])
+		if errors.Is(err,fs.ErrNotExist) {
+			return fmt.Errorf("cd: %s: No such home directory",args[1])
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
@@ -71,7 +93,12 @@ func main() {
 			fmt.Println(dirName)
 
 		case "cd":
-			handleCD(args)
+			errCD := handleCD(args)
+
+			if errCD != nil {
+				fmt.Print(errCD)
+			}
+
 		case "type":
 			handleTYPE(args)
 		case "execFile":
@@ -79,7 +106,7 @@ func main() {
 		default:
 
 		}
-		
+
 		fmt.Println()
 	}
 }
