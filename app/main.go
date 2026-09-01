@@ -63,8 +63,40 @@ func handleCD(args []string) (error) {
 	return nil
 }
 
+func handleTYPE(args []string,builtInSet map[string]string) (string, error) {
+	if len(args) == 1 {
+		return "No args provided" , nil
+	}
+
+	_ , ok := builtInSet[args[1]]
+
+	if ok {
+		return fmt.Sprintf("%s is a shell builtin",args[1]) , nil
+	} else {
+		pathAns , err := exec.LookPath(args[1])
+
+		if errors.Is(err , exec.ErrNotFound) {
+			return fmt.Sprintf("%s: not found",args[1]), nil
+		}
+
+		if err != nil {
+			return fmt.Sprintf("Error while visiting file") , err
+		}
+
+		return fmt.Sprintf("%s is %s",args[1],pathAns) , nil
+	}
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
+
+	builtInSet := map[string]string{
+		"type":"get cmd type" ,
+		"echo":"print" ,
+		"exit":"exiting" ,
+		"pwd":"get working directory",
+		"cd":"change directory",
+	}
 
 	for {
 		fmt.Print("$ ")
@@ -100,7 +132,10 @@ func main() {
 			}
 
 		case "type":
-			handleTYPE(args)
+			typeString , _ := handleTYPE(args,builtInSet)
+
+			fmt.Print(typeString)
+
 		case "execFile":
 			handleEXECFILE(args)
 		default:
