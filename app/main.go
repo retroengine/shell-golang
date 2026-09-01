@@ -23,7 +23,13 @@ func handleInput(reader *bufio.Reader) ([]string , error) {
 	return args , nil
 }
 
-func handleEcho(srgs []string) ()
+func handleEcho(args []string) (string , error) {
+	cleanStr := strings.Join(args[1:] , " ")
+
+	cleanStr = strings.ReplaceAll(cleanStr, "'","")
+
+	return cleanStr , nil;
+}
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
@@ -40,7 +46,10 @@ func main() {
 		case "exit":
 			break
 		case "echo":
-			handleEcho(args)
+			
+			cleanStr , _ := handleEcho(args)
+			fmt.Println(cleanStr)
+
 		case "pwd":
 			handlePWD(args)
 		case "cd":
