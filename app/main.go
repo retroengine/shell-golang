@@ -87,6 +87,34 @@ func handleTYPE(args []string,builtInSet map[string]string) (string, error) {
 	}
 }
 
+func handleExecFile(args []string) (string,error) {
+
+	_ , err := exec.LookPath(args[0])
+
+	if errors.Is(err,exec.ErrNotFound) {
+		return fmt.Sprintf("%s: command not found",args[0]), err
+	}
+
+	if err != nil {
+		return fmt.Sprintf("Error while visiting file") , err
+	}
+
+	cmd := exec.Command(args[0],args[1:]...)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin 
+
+	err_cmd := cmd.Run()
+
+	if err_cmd != nil {
+		return fmt.Sprint("Error while executing file.") , err_cmd
+	}
+
+	return "" , nil
+
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
@@ -136,10 +164,12 @@ func main() {
 
 			fmt.Print(typeString)
 
-		case "execFile":
-			handleEXECFILE(args)
 		default:
+			msg , err := handleExecFile(args)
 
+			if msg == "" || err != nil {
+				fmt.Print(err)
+			}
 		}
 
 		fmt.Println()
