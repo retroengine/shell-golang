@@ -30,6 +30,17 @@ func handleEcho(args []string) (string , error) {
 
 	return cleanStr , nil;
 }
+
+func handlePWD(args []string) (string , error) {
+	dir , err := os.Getwd()
+
+	if err != nil {
+		return "",err
+	}
+
+	return dir,nil
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
@@ -46,12 +57,19 @@ func main() {
 		case "exit":
 			break
 		case "echo":
-			
+
 			cleanStr , _ := handleEcho(args)
 			fmt.Println(cleanStr)
 
 		case "pwd":
-			handlePWD(args)
+			dirName , err := handlePWD(args)
+
+			if err != nil {
+				fmt.Printf("Error printing the working directory %s",err)
+			}
+
+			fmt.Println(dirName)
+
 		case "cd":
 			handleCD(args)
 		case "type":
@@ -61,5 +79,7 @@ func main() {
 		default:
 
 		}
+		
+		fmt.Println()
 	}
 }
