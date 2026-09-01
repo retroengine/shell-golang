@@ -11,7 +11,6 @@ import (
 )
 
 func handleInput(reader *bufio.Reader) ([]string , error) {
-
 	line , err := reader.ReadString('\n')
 
 	if err != nil {
@@ -19,13 +18,12 @@ func handleInput(reader *bufio.Reader) ([]string , error) {
 	}
 
 	line = strings.TrimSpace(line)
-
 	args := strings.Split(line, " ")
 
 	return args , nil
 }
 
-func handleEcho(srgs []string)
+func handleEcho(srgs []string) ()
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
