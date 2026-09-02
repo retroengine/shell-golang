@@ -24,6 +24,10 @@ func handleInput(reader *bufio.Reader) ([]string , error) {
 }
 
 func handleEcho(args []string) (string , error) {
+	if len(args) == 0 {
+		return "" , nil
+	}
+
 	cleanStr := strings.Join(args[1:] , " ")
 
 	cleanStr = strings.ReplaceAll(cleanStr, "'","")
@@ -42,6 +46,10 @@ func handlePWD(args []string) (string , error) {
 }
 
 func handleCD(args []string) (error) {
+	if len(args) < 2 {
+		return fmt.Errorf("cd: missing operand")
+	}
+
 	if args[1] == "~" {
 		homePath := os.Getenv("HOME")
 		err := os.Chdir(homePath)
@@ -88,6 +96,9 @@ func handleTYPE(args []string,builtInSet map[string]string) (string, error) {
 }
 
 func handleExecFile(args []string) (string,error) {
+	if len(args) == 0 {
+		return "" , fmt.Errorf("no command provided")
+	}
 
 	_ , err := exec.LookPath(args[0])
 
@@ -167,9 +178,10 @@ func main() {
 		default:
 			msg , err := handleExecFile(args)
 
-			if msg == "" || err != nil {
+			if msg != "" || err != nil {
 				fmt.Print(err)
 			}
+
 		}
 
 		fmt.Println()

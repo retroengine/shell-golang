@@ -1,0 +1,107 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  # The point of this matrix: the shell calls into the OS for cwd, PATH
+  # lookups and process spawning, so "passes on my machine" proves little.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache: false # no dependencies, nothing to cache
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # -shuffle=on matters here: these tests mutate process-global state
+      # (working directory, HOME), so a hidden ordering dependency would be
+      # a real bug. Shuffling makes it fail loudly instead of silently.
+      - name: test
+        run: go test -shuffle=on -timeout 5m ./...
+
+  # Needs a C toolchain, which the Linux runner has and Windows does not.
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache: false
+      - run: go test -race -shuffle=on -timeout 5m ./...
+
+  # The seed corpus runs as part of the normal test job; this one actually
+  # generates new inputs looking for a crash. Any crash it finds is uploaded
+  # so it can be added to testdata/ as a permanent regression test.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzHandleInput, FuzzHandleEcho, FuzzHandleTYPE]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache: false
+
+      - name: fuzz ${{ matrix.target }}
+        run: go test -fuzz ${{ matrix.target }} -fuzztime 60s -run '^$' ./...
+
+      - name: upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers-${{ matrix.target }}
+          path: app/testdata/fuzz/
+          if-no-files-found: ignore
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+          cache: false
+
+      - name: test with coverage
+        run: go test -coverprofile=coverage.out -timeout 5m ./...
+
+      - name: coverage report
+        run: |
+          go tool cover -func=coverage.out
+          echo "### Coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | tail -20 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: app/coverage.out

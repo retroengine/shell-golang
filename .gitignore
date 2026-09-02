@@ -1,0 +1,19 @@
+# Compiled binaries
+/app/shell-golang
+/app/shell-golang.exe
+/app/shell
+/app/shell.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test artifacts
+*.test
+coverage.out
+coverage.html
+
+# Editor / OS
+.DS_Store
+.idea/
+*.swp
