@@ -17,6 +17,10 @@ import (
 //
 // A crash is written to testdata/fuzz/ and then replays as a normal test
 // case forever after, so a bug found once cannot come back unnoticed.
+//
+// These use failLine (report_test.go) so a fuzz failure reads exactly like a
+// table failure. They deliberately do NOT call report: fuzzing runs millions
+// of inputs and a tick per input would bury the one that mattered.
 
 func FuzzHandleInput(f *testing.F) {
 	f.Add("echo hello\n")
@@ -35,7 +39,12 @@ func FuzzHandleInput(f *testing.F) {
 		// When there is no error there must be usable args, because main
 		// indexes args[0] immediately without checking.
 		if err == nil && len(args) == 0 {
-			t.Fatalf("handleInput(%q)\n  got:  empty args with a nil error\n  want: at least one element, since callers index args[0]", line)
+			t.Fatal(failLine(
+				typed(line),
+				"at least one argument",
+				"no arguments, alongside a nil error",
+				"main indexes args[0] immediately without checking",
+			))
 		}
 	})
 }
@@ -52,11 +61,15 @@ func FuzzHandleEcho(f *testing.F) {
 		// Exercised the way main calls it: the command name plus one argument.
 		got, err := handleEcho([]string{"echo", word})
 
+		call := cmdLine([]string{"echo", word})
+
 		if err != nil {
-			t.Fatalf("handleEcho([echo %q])\n  got err: %v\n  want err: <nil> for every input", word, err)
+			t.Fatal(failLine(call, "no error", show(err.Error()),
+				"handleEcho must return a nil error for every input"))
 		}
 		if strings.Contains(got, "'") {
-			t.Fatalf("handleEcho([echo %q])\n  got:  %q\n  want: no single quotes left in the result", word, got)
+			t.Fatal(failLine(call, "no single quotes left in the result", show(got),
+				"handleEcho strips every ' character"))
 		}
 	})
 }
@@ -73,15 +86,20 @@ func FuzzHandleTYPE(f *testing.F) {
 	f.Fuzz(func(t *testing.T, name string) {
 		got, err := handleTYPE([]string{"type", name}, testBuiltins())
 
+		call := cmdLine([]string{"type", name})
+
 		if err != nil {
 			// A real lookup error is acceptable; an empty message is not.
 			if got == "" {
-				t.Fatalf("handleTYPE([type %q])\n  got:  empty message alongside err %v\n  want: a printable message", name, err)
+				t.Fatal(failLine(call, "a printable message",
+					"nothing printable, alongside error "+show(err.Error()),
+					"whatever happens, the shell has something to print"))
 			}
 			return
 		}
 		if got == "" {
-			t.Fatalf("handleTYPE([type %q])\n  got:  %q\n  want: a non-empty message when err is nil", name, got)
+			t.Fatal(failLine(call, "a non-empty message", show(got),
+				"a nil error means the lookup completed, so it must have said something"))
 		}
 	})
 }

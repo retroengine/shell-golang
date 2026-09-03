@@ -18,11 +18,11 @@ case "$MODE" in
     echo "==> vet"
     go vet ./... || exit 1
     echo "==> all tests"
-    go test ./...
+    go test -v ./...
     ;;
   cover)
     echo "==> coverage"
-    go test -coverprofile=coverage.out ./... || exit 1
+    go test -v -coverprofile=coverage.out ./... || exit 1
     go tool cover -func=coverage.out
     go tool cover -html=coverage.out -o coverage.html
     echo "==> wrote app/coverage.html"
@@ -30,11 +30,12 @@ case "$MODE" in
   strict)
     # Shuffled and repeated: catches order dependence and flakes. These
     # tests change the working directory and HOME, so this is the run that
-    # actually proves they are independent.
+    # actually proves they are independent. Long output by design: -v times
+    # three repeats prints every case's expected/received block each pass.
     echo "==> vet"
     go vet ./... || exit 1
     echo "==> strict: shuffled, 3 repeats"
-    go test -shuffle=on -count=3 -timeout 5m ./...
+    go test -v -shuffle=on -count=3 -timeout 5m ./...
     ;;
   fuzz)
     # Generates new inputs hunting for a crash. Ctrl-C to stop early; any

@@ -8,6 +8,12 @@ param(
 
 Set-Location (Join-Path $PSScriptRoot 'app')
 
+# The test reporter prints Unicode tick/cross marks. Windows PowerShell 5.1
+# renders them as mojibake unless the console is told the output is UTF-8.
+# Set NO_COLOR=1 to drop the ANSI colours, or SHELL_TEST_ASCII=1 to fall back
+# to plain [PASS] / [FAIL] markers.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+
 switch ($Mode) {
     'unit' {
         Write-Host '==> unit tests'
@@ -22,11 +28,11 @@ switch ($Mode) {
         go vet ./...
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         Write-Host '==> all tests'
-        go test ./...
+        go test -v ./...
     }
     'cover' {
         Write-Host '==> coverage'
-        go test -coverprofile=coverage.out ./...
+        go test -v -coverprofile=coverage.out ./...
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         go tool cover -func=coverage.out
         go tool cover -html=coverage.out -o coverage.html
@@ -40,7 +46,7 @@ switch ($Mode) {
         go vet ./...
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         Write-Host '==> strict: shuffled, 3 repeats'
-        go test -shuffle=on -count=3 -timeout 5m ./...
+        go test -v -shuffle=on -count=3 -timeout 5m ./...
     }
     'fuzz' {
         # Generates new inputs hunting for a crash. Ctrl-C to stop early; any

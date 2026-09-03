@@ -12,6 +12,12 @@ import (
 // tables: VALID (happy path), EDGE (surprising-but-correct), MUST FAIL
 // (the function is expected to report a failure).
 //
+// Every case carries a `why` note and every assertion goes through a helper
+// from report_test.go, so each case prints the same expected/received block
+// whether it passed or failed. Never write a bare t.Errorf/t.Fatalf inside a
+// table — use wantEqual / wantArgs / wantContains / wantSameDir /
+// wantErrContains / mustNoErr / mustErr.
+//
 // Note on "failure": these functions report failure two different ways.
 // handleCD / handleExecFile return a real error. handleTYPE reports a
 // missing command with a *string* ("x: not found") and a nil error. The
@@ -30,39 +36,41 @@ func TestHandleInput_Valid(t *testing.T) {
 		name  string
 		input string
 		want  []string
+		why   string
 	}{
 		{
 			name:  "single command",
 			input: "pwd\n",
 			want:  []string{"pwd"},
+			why:   "a bare command becomes a one-element argument list",
 		},
 		{
 			name:  "command with one argument",
 			input: "cd /tmp\n",
 			want:  []string{"cd", "/tmp"},
+			why:   "the space separates the command from its argument",
 		},
 		{
 			name:  "command with several arguments",
 			input: "echo hello world\n",
 			want:  []string{"echo", "hello", "world"},
+			why:   "every space-separated word becomes its own element",
 		},
 		{
 			name:  "surrounding whitespace is trimmed",
 			input: "   pwd   \n",
 			want:  []string{"pwd"},
+			why:   "the line is trimmed before it is split",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
 			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
 
-			if err != nil {
-				t.Fatalf("handleInput(%q)\n  got err: %v\n  want err: <nil>", tt.input, err)
-			}
-			if !equalArgs(got, tt.want) {
-				t.Errorf("handleInput(%q)\n  got:  %#v\n  want: %#v", tt.input, got, tt.want)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
 		})
 	}
 }
@@ -75,41 +83,38 @@ func TestHandleInput_Edge(t *testing.T) {
 		why   string
 	}{
 		{
-			name:  "repeated spaces produce empty arguments",
+			name:  "repeated spaces collapse into one boundary",
 			input: "echo   hello\n",
-			want:  []string{"echo", "", "", "hello"},
-			why:   "strings.Split does not collapse runs of spaces the way a real shell does",
+			want:  []string{"echo", "hello"},
+			why:   "spec: consecutive whitespace is collapsed outside quotes",
 		},
 		{
-			name:  "empty line yields one empty argument",
+			name:  "empty line yields no arguments",
 			input: "\n",
-			want:  []string{""},
-			why:   "an empty line is not an error; it splits into a single empty string",
+			want:  nil,
+			why:   "an empty line has no words on it, so it tokenizes to zero arguments",
 		},
 		{
-			name:  "whitespace-only line yields one empty argument",
+			name:  "whitespace-only line yields no arguments",
 			input: "    \n",
-			want:  []string{""},
-			why:   "trimmed to empty, then split",
+			want:  nil,
+			why:   "trimmed to empty, then tokenizes to zero arguments",
 		},
 		{
-			name:  "tab is not treated as a separator",
+			name:  "tab is treated as a separator like space",
 			input: "echo\thello\n",
-			want:  []string{"echo\thello"},
-			why:   "only the space character separates arguments",
+			want:  []string{"echo", "hello"},
+			why:   "spec: tab is whitespace just like space outside quotes",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
 			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
 
-			if err != nil {
-				t.Fatalf("handleInput(%q)\n  got err: %v\n  want err: <nil>\n  note: %s", tt.input, err, tt.why)
-			}
-			if !equalArgs(got, tt.want) {
-				t.Errorf("handleInput(%q)\n  got:  %#v\n  want: %#v\n  note: %s", tt.input, got, tt.want, tt.why)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
 		})
 	}
 }
@@ -134,14 +139,139 @@ func TestHandleInput_MustFail(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
 			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
 
-			if err == nil {
-				t.Fatalf("handleInput(%q)\n  got:  %#v, err = <nil>\n  want: an error\n  note: %s", tt.input, got, tt.why)
-			}
-			if got != nil {
-				t.Errorf("handleInput(%q)\n  got:  %#v\n  want: nil args alongside the error", tt.input, got)
-			}
+			mustErr(t, call, err, tt.why)
+			wantArgs(t, call, got, nil, "the error must come with nil args, not partial data")
+		})
+	}
+}
+
+// ============================================================
+// handleInput — single quotes
+// ============================================================
+
+func TestHandleInput_SingleQuotes_Valid(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+		why   string
+	}{
+		{
+			name:  "spaces are preserved within quotes",
+			input: "echo 'hello    world'\n",
+			want:  []string{"echo", "hello    world"},
+			why:   "spec: spaces are preserved within quotes",
+		},
+		{
+			name:  "consecutive unquoted spaces collapse",
+			input: "echo hello    world\n",
+			want:  []string{"echo", "hello", "world"},
+			why:   "spec: consecutive spaces are collapsed unless quoted",
+		},
+		{
+			name:  "adjacent quoted strings concatenate",
+			input: "echo 'hello''world'\n",
+			want:  []string{"echo", "helloworld"},
+			why:   "spec: adjacent quoted strings 'hello' and 'world' are concatenated",
+		},
+		{
+			name:  "empty quotes next to unquoted text are ignored",
+			input: "echo hello''world\n",
+			want:  []string{"echo", "helloworld"},
+			why:   "spec: empty quotes '' are ignored",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
+			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
+
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleInput_SingleQuotes_Edge(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+		why   string
+	}{
+		{
+			name:  "special characters lose meaning inside quotes",
+			input: "echo '$HOME * ~'\n",
+			want:  []string{"echo", "$HOME * ~"},
+			why:   "spec: characters inside single quotes, including $, *, and ~, lose their special meaning and are treated literally",
+		},
+		{
+			name:  "whitespace outside quotes still delimits quoted arguments",
+			input: "echo 'a'   'b'\n",
+			want:  []string{"echo", "a", "b"},
+			why:   "spec: consecutive whitespace outside quotes is collapsed, but still separates arguments",
+		},
+		{
+			name:  "a quoted segment merges with adjacent unquoted text",
+			input: "echo 'hello'world\n",
+			want:  []string{"echo", "helloworld"},
+			why:   "spec: quoted strings placed next to other text form a single argument",
+		},
+		{
+			name:  "a lone pair of empty quotes is still an argument boundary",
+			input: "echo '' next\n",
+			want:  []string{"echo", "", "next"},
+			why:   "spec: empty quotes only vanish when adjacent to other text with no separating whitespace; surrounded by spaces they still form an argument",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
+			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
+
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handleInput — single quotes with external-command arguments
+// ============================================================
+
+func TestHandleInput_SingleQuotes_MultipleFileArguments(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+		why   string
+	}{
+		{
+			name:  "two quoted arguments each preserve their internal spaces",
+			input: "cat '/tmp/file name' '/tmp/file name with spaces'\n",
+			want:  []string{"cat", "/tmp/file name", "/tmp/file name with spaces"},
+			why:   "spec: single quotes preserve whitespace inside them, and unquoted whitespace between quoted strings still separates them into distinct arguments",
+		},
+		{
+			name:  "three quoted arguments stay distinct",
+			input: "echo 'a b' 'c d' 'e f'\n",
+			want:  []string{"echo", "a b", "c d", "e f"},
+			why:   "spec: each quoted string is its own argument regardless of how many appear on the line",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
+			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
+
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
 		})
 	}
 }
@@ -155,39 +285,41 @@ func TestHandleEcho_Valid(t *testing.T) {
 		name string
 		args []string
 		want string
+		why  string
 	}{
 		{
 			name: "single word",
 			args: []string{"echo", "hello"},
 			want: "hello",
+			why:  "the command name is dropped and the rest is printed",
 		},
 		{
 			name: "several words are rejoined with single spaces",
 			args: []string{"echo", "hello", "world"},
 			want: "hello world",
+			why:  "arguments are joined back together with one space each",
 		},
 		{
 			name: "single quotes are stripped",
 			args: []string{"echo", "'hello'", "'world'"},
 			want: "hello world",
+			why:  "quotes delimit an argument, they are not part of it",
 		},
 		{
 			name: "mixed quoted and unquoted",
 			args: []string{"echo", "'foo'", "bar"},
 			want: "foo bar",
+			why:  "quoting one argument does not change the others",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			got, err := handleEcho(tt.args)
 
-			if err != nil {
-				t.Fatalf("handleEcho(%#v)\n  got err: %v\n  want err: <nil>", tt.args, err)
-			}
-			if got != tt.want {
-				t.Errorf("handleEcho(%#v)\n  got:  %q\n  want: %q", tt.args, got, tt.want)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, got, tt.want, tt.why)
 		})
 	}
 }
@@ -239,14 +371,11 @@ func TestHandleEcho_Edge(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			got, err := handleEcho(tt.args)
 
-			if err != nil {
-				t.Fatalf("handleEcho(%#v)\n  got err: %v\n  want err: <nil>\n  note: %s", tt.args, err, tt.why)
-			}
-			if got != tt.want {
-				t.Errorf("handleEcho(%#v)\n  got:  %q\n  want: %q\n  note: %s", tt.args, got, tt.want, tt.why)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, got, tt.want, tt.why)
 		})
 	}
 }
@@ -254,19 +383,25 @@ func TestHandleEcho_Edge(t *testing.T) {
 // handleEcho has no failure mode: it cannot return a non-nil error for any
 // input. Rather than fake a must-fail table, this pins that contract down.
 func TestHandleEcho_NeverErrors(t *testing.T) {
-	inputs := [][]string{
-		nil,
-		{},
-		{"echo"},
-		{"echo", ""},
-		{"echo", "'"},
-		{"echo", strings.Repeat("x", 10000)},
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "nil args", args: nil},
+		{name: "empty args", args: []string{}},
+		{name: "command name only", args: []string{"echo"}},
+		{name: "empty argument", args: []string{"echo", ""}},
+		{name: "unbalanced quote", args: []string{"echo", "'"}},
+		{name: "very long argument", args: []string{"echo", strings.Repeat("x", 10000)}},
 	}
 
-	for _, args := range inputs {
-		if _, err := handleEcho(args); err != nil {
-			t.Errorf("handleEcho(%#v)\n  got err: %v\n  want err: <nil> for every input", args, err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			_, err := handleEcho(tt.args)
+
+			mustNoErr(t, call, err, "handleEcho must return a nil error for every input")
+		})
 	}
 }
 
@@ -280,13 +415,11 @@ func TestHandlePWD_Valid(t *testing.T) {
 		t.Fatalf("cannot determine working directory for the test: %v", err)
 	}
 
+	call := "pwd"
 	got, err := handlePWD([]string{"pwd"})
-	if err != nil {
-		t.Fatalf("handlePWD([pwd])\n  got err: %v\n  want err: <nil>", err)
-	}
-	if got != want {
-		t.Errorf("handlePWD([pwd])\n  got:  %q\n  want: %q", got, want)
-	}
+
+	mustNoErr(t, call, err, "pwd on a live working directory cannot fail")
+	wantEqual(t, call, got, want, "pwd reports the process working directory verbatim")
 }
 
 func TestHandlePWD_Edge_IgnoresArgs(t *testing.T) {
@@ -298,22 +431,20 @@ func TestHandlePWD_Edge_IgnoresArgs(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
+		why  string
 	}{
-		{name: "nil args", args: nil},
-		{name: "empty args", args: []string{}},
-		{name: "unexpected extra args", args: []string{"pwd", "ignored", "also-ignored"}},
+		{name: "nil args", args: nil, why: "args are never read, so nil is safe"},
+		{name: "empty args", args: []string{}, why: "args are never read, so an empty slice is safe"},
+		{name: "unexpected extra args", args: []string{"pwd", "ignored", "also-ignored"}, why: "args are ignored entirely"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			got, err := handlePWD(tt.args)
 
-			if err != nil {
-				t.Fatalf("handlePWD(%#v)\n  got err: %v\n  want err: <nil>", tt.args, err)
-			}
-			if got != want {
-				t.Errorf("handlePWD(%#v)\n  got:  %q\n  want: %q\n  note: args are ignored entirely", tt.args, got, want)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, got, want, tt.why)
 		})
 	}
 }
@@ -334,16 +465,11 @@ func TestHandlePWD_TracksDirectoryChanges(t *testing.T) {
 		t.Fatalf("setup: cannot chdir to %q: %v", tmp, err)
 	}
 
+	call := "pwd (after chdir to " + tmp + ")"
 	got, err := handlePWD([]string{"pwd"})
-	if err != nil {
-		t.Fatalf("handlePWD([pwd]) after chdir\n  got err: %v\n  want err: <nil>", err)
-	}
-	// macOS reports /private/var for /var, so resolve both sides before comparing.
-	want, _ := filepath.EvalSymlinks(tmp)
-	gotResolved, _ := filepath.EvalSymlinks(got)
-	if gotResolved != want {
-		t.Errorf("handlePWD([pwd]) after chdir to %q\n  got:  %q\n  want: %q", tmp, gotResolved, want)
-	}
+
+	mustNoErr(t, call, err, "the directory exists, so Getwd succeeds")
+	wantSameDir(t, call, got, tmp, "pwd reads the current directory on each call, it does not cache it")
 }
 
 // handlePWD has no portable failure mode: os.Getwd only fails in situations
@@ -365,14 +491,13 @@ func TestHandleCD_Valid(t *testing.T) {
 		// Registered after TempDir so it runs before TempDir's removal.
 		t.Cleanup(func() { os.Chdir(original) })
 
-		if err := handleCD([]string{"cd", tmp}); err != nil {
-			t.Fatalf("handleCD([cd %s])\n  got err: %v\n  want err: <nil>", tmp, err)
-		}
+		call := "cd " + tmp
+		err := handleCD([]string{"cd", tmp})
+
+		mustNoErr(t, call, err, "the target directory exists")
 
 		got, _ := os.Getwd()
-		if !sameDir(got, tmp) {
-			t.Errorf("handleCD([cd %s])\n  got cwd:  %q\n  want cwd: %q", tmp, got, tmp)
-		}
+		wantSameDir(t, "pwd", got, tmp, "a successful cd moves the process")
 	})
 
 	t.Run("tilde expands to HOME", func(t *testing.T) {
@@ -380,14 +505,13 @@ func TestHandleCD_Valid(t *testing.T) {
 		t.Setenv("HOME", home) // set explicitly so the test does not depend on the machine
 		t.Cleanup(func() { os.Chdir(original) })
 
-		if err := handleCD([]string{"cd", "~"}); err != nil {
-			t.Fatalf("handleCD([cd ~]) with HOME=%s\n  got err: %v\n  want err: <nil>", home, err)
-		}
+		call := "cd ~ (with HOME=" + home + ")"
+		err := handleCD([]string{"cd", "~"})
+
+		mustNoErr(t, call, err, "HOME points at a real directory")
 
 		got, _ := os.Getwd()
-		if !sameDir(got, home) {
-			t.Errorf("handleCD([cd ~]) with HOME=%s\n  got cwd:  %q\n  want cwd: %q", home, got, home)
-		}
+		wantSameDir(t, "pwd", got, home, "~ resolves to $HOME")
 	})
 }
 
@@ -395,28 +519,26 @@ func TestHandleCD_Edge(t *testing.T) {
 	original := chdirGuard(t)
 
 	t.Run("changing to the current directory is a no-op", func(t *testing.T) {
-		if err := handleCD([]string{"cd", "."}); err != nil {
-			t.Fatalf("handleCD([cd .])\n  got err: %v\n  want err: <nil>", err)
-		}
+		call := "cd ."
+		err := handleCD([]string{"cd", "."})
+
+		mustNoErr(t, call, err, ". is always a valid directory")
 
 		got, _ := os.Getwd()
-		if !sameDir(got, original) {
-			t.Errorf("handleCD([cd .])\n  got cwd:  %q\n  want cwd: %q (unchanged)", got, original)
-		}
+		wantSameDir(t, "pwd", got, original, "cd . leaves the process where it was")
 	})
 
 	t.Run("extra arguments after the path are ignored", func(t *testing.T) {
 		tmp := t.TempDir()
 		t.Cleanup(func() { os.Chdir(original) })
 
-		if err := handleCD([]string{"cd", tmp, "unexpected", "extra"}); err != nil {
-			t.Fatalf("handleCD([cd %s unexpected extra])\n  got err: %v\n  want err: <nil>", tmp, err)
-		}
+		call := "cd " + tmp + " unexpected extra"
+		err := handleCD([]string{"cd", tmp, "unexpected", "extra"})
+
+		mustNoErr(t, call, err, "only args[1] is read, the extra words cannot make it fail")
 
 		got, _ := os.Getwd()
-		if !sameDir(got, tmp) {
-			t.Errorf("handleCD([cd %s unexpected extra])\n  got cwd:  %q\n  want cwd: %q\n  note: only args[1] is read", tmp, got, tmp)
-		}
+		wantSameDir(t, "pwd", got, tmp, "only args[1] is read")
 	})
 }
 
@@ -432,8 +554,7 @@ func TestHandleCD_MustFail(t *testing.T) {
 	tests := []struct {
 		name        string
 		args        []string
-		home        string // when non-empty, HOME is set to this for the subtest
-		setEmptyEnv bool   // when true, HOME is explicitly cleared
+		setEmptyEnv bool // when true, HOME is explicitly cleared
 		wantContain string
 		why         string
 	}{
@@ -466,27 +587,25 @@ func TestHandleCD_MustFail(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// A cd that unexpectedly succeeds must not leak into the next row,
+			// which asserts the process has not moved.
+			t.Cleanup(func() { os.Chdir(original) })
+
 			if tt.setEmptyEnv {
 				t.Setenv("HOME", "")
 			}
 
+			call := cmdLine(tt.args)
 			err := handleCD(tt.args)
 
-			if err == nil {
-				cwd, _ := os.Getwd()
-				os.Chdir(original)
-				t.Fatalf("handleCD(%#v)\n  got err: <nil> (cwd is now %q)\n  want err: an error\n  note: %s", tt.args, cwd, tt.why)
-			}
-			if tt.wantContain != "" && !strings.Contains(err.Error(), tt.wantContain) {
-				t.Errorf("handleCD(%#v)\n  got err:  %q\n  want err containing: %q\n  note: %s", tt.args, err.Error(), tt.wantContain, tt.why)
+			mustErr(t, call, err, tt.why)
+			if tt.wantContain != "" {
+				wantErrContains(t, call, err, tt.wantContain, tt.why)
 			}
 
 			// A failed cd must not have moved the process.
 			cwd, _ := os.Getwd()
-			if !sameDir(cwd, original) {
-				t.Errorf("handleCD(%#v) failed but still changed directory\n  got cwd:  %q\n  want cwd: %q", tt.args, cwd, original)
-				os.Chdir(original)
-			}
+			wantSameDir(t, "pwd", cwd, original, "a cd that fails must leave the process where it was")
 		})
 	}
 }
@@ -510,30 +629,29 @@ func TestHandleTYPE_Valid(t *testing.T) {
 		name        string
 		args        []string
 		wantContain string
+		why         string
 	}{
-		{name: "builtin echo", args: []string{"type", "echo"}, wantContain: "echo is a shell builtin"},
-		{name: "builtin pwd", args: []string{"type", "pwd"}, wantContain: "pwd is a shell builtin"},
-		{name: "builtin cd", args: []string{"type", "cd"}, wantContain: "cd is a shell builtin"},
-		{name: "builtin type", args: []string{"type", "type"}, wantContain: "type is a shell builtin"},
-		{name: "builtin exit", args: []string{"type", "exit"}, wantContain: "exit is a shell builtin"},
+		{name: "builtin echo", args: []string{"type", "echo"}, wantContain: "echo is a shell builtin", why: "echo is in the builtin table"},
+		{name: "builtin pwd", args: []string{"type", "pwd"}, wantContain: "pwd is a shell builtin", why: "pwd is in the builtin table"},
+		{name: "builtin cd", args: []string{"type", "cd"}, wantContain: "cd is a shell builtin", why: "cd is in the builtin table"},
+		{name: "builtin type", args: []string{"type", "type"}, wantContain: "type is a shell builtin", why: "type reports itself as a builtin"},
+		{name: "builtin exit", args: []string{"type", "exit"}, wantContain: "exit is a shell builtin", why: "exit is in the builtin table"},
 		{
 			// "go" rather than "ls": present on PATH in every shell that can run go test.
 			name:        "external command resolves to a path",
 			args:        []string{"type", "go"},
 			wantContain: "go is ",
+			why:         "a non-builtin is looked up on PATH; the path itself is machine-specific",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			got, err := handleTYPE(tt.args, testBuiltins())
 
-			if err != nil {
-				t.Fatalf("handleTYPE(%#v)\n  got err: %v\n  want err: <nil>", tt.args, err)
-			}
-			if !strings.Contains(got, tt.wantContain) {
-				t.Errorf("handleTYPE(%#v)\n  got:  %q\n  want containing: %q", tt.args, got, tt.wantContain)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantContains(t, call, got, tt.wantContain, tt.why)
 		})
 	}
 }
@@ -541,43 +659,33 @@ func TestHandleTYPE_Valid(t *testing.T) {
 func TestHandleTYPE_Edge(t *testing.T) {
 	t.Run("nil builtin map falls through to PATH lookup", func(t *testing.T) {
 		args := []string{"type", "go"}
+		call := cmdLine(args) + " (with no builtin table)"
 
 		got, err := handleTYPE(args, nil)
 
-		if err != nil {
-			t.Fatalf("handleTYPE(%#v, nil)\n  got err: %v\n  want err: <nil>\n  note: reading a nil map is legal in Go", args, err)
-		}
-		if !strings.Contains(got, "go is ") {
-			t.Errorf("handleTYPE(%#v, nil)\n  got:  %q\n  want containing: %q", args, got, "go is ")
-		}
+		mustNoErr(t, call, err, "reading a nil map is legal in Go")
+		wantContains(t, call, got, "go is ", "with no builtin table every name falls through to PATH")
 	})
 
 	t.Run("builtin wins over a real binary of the same name", func(t *testing.T) {
 		args := []string{"type", "go"}
 		builtins := map[string]string{"go": "pretend builtin"}
+		call := cmdLine(args) + " (with go registered as a builtin)"
 
 		got, err := handleTYPE(args, builtins)
 
-		if err != nil {
-			t.Fatalf("handleTYPE(%#v)\n  got err: %v\n  want err: <nil>", args, err)
-		}
-		want := "go is a shell builtin"
-		if got != want {
-			t.Errorf("handleTYPE(%#v) with go registered as a builtin\n  got:  %q\n  want: %q\n  note: the builtin table is consulted before PATH", args, got, want)
-		}
+		mustNoErr(t, call, err, "a builtin hit never touches PATH")
+		wantEqual(t, call, got, "go is a shell builtin", "the builtin table is consulted before PATH")
 	})
 
 	t.Run("empty command name is reported as not found", func(t *testing.T) {
 		args := []string{"type", ""}
+		call := cmdLine(args)
 
 		got, err := handleTYPE(args, testBuiltins())
 
-		if err != nil {
-			t.Fatalf("handleTYPE(%#v)\n  got err: %v\n  want err: <nil>", args, err)
-		}
-		if !strings.Contains(got, "not found") {
-			t.Errorf("handleTYPE(%#v)\n  got:  %q\n  want containing: %q", args, got, "not found")
-		}
+		mustNoErr(t, call, err, "an empty name is a miss, not an error")
+		wantContains(t, call, got, "not found", "the empty string is in neither the builtin table nor PATH")
 	})
 }
 
@@ -606,14 +714,11 @@ func TestHandleTYPE_MustFail(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			got, err := handleTYPE(tt.args, testBuiltins())
 
-			if err != nil {
-				t.Fatalf("handleTYPE(%#v)\n  got err: %v\n  want err: <nil>\n  note: %s", tt.args, err, tt.why)
-			}
-			if got != tt.want {
-				t.Errorf("handleTYPE(%#v)\n  got:  %q\n  want: %q\n  note: %s", tt.args, got, tt.want, tt.why)
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, got, tt.want, tt.why)
 		})
 	}
 }
@@ -630,21 +735,19 @@ func TestHandleExecFile_Valid(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
+		why  string
 	}{
-		{name: "command with an argument", args: []string{"go", "version"}},
-		{name: "command with several arguments", args: []string{"go", "env", "GOOS"}},
+		{name: "command with an argument", args: []string{"go", "version"}, why: "go is on PATH and `go version` exits zero"},
+		{name: "command with several arguments", args: []string{"go", "env", "GOOS"}, why: "every argument after the command name is forwarded"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			msg, err := handleExecFile(tt.args)
 
-			if err != nil {
-				t.Fatalf("handleExecFile(%#v)\n  got err: %v\n  want err: <nil>", tt.args, err)
-			}
-			if msg != "" {
-				t.Errorf("handleExecFile(%#v)\n  got msg:  %q\n  want msg: %q on success", tt.args, msg, "")
-			}
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, "", "a successful run returns an empty message; the output went to stdout")
 		})
 	}
 }
@@ -678,20 +781,19 @@ func TestHandleExecFile_MustFail(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
 			msg, err := handleExecFile(tt.args)
 
-			if err == nil {
-				t.Fatalf("handleExecFile(%#v)\n  got:  msg = %q, err = <nil>\n  want: an error\n  note: %s", tt.args, msg, tt.why)
-			}
-			if msg != tt.wantMsg {
-				t.Errorf("handleExecFile(%#v)\n  got msg:  %q\n  want msg: %q\n  got err:  %v\n  note: %s", tt.args, msg, tt.wantMsg, err, tt.why)
-			}
+			mustErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, tt.wantMsg, tt.why)
 		})
 	}
 }
 
 // ============================================================
 // helpers
+//
+// The assertion helpers these feed live in report_test.go.
 // ============================================================
 
 func equalArgs(got, want []string) bool {

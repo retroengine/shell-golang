@@ -18,7 +18,38 @@ func handleInput(reader *bufio.Reader) ([]string , error) {
 	}
 
 	line = strings.TrimSpace(line)
-	args := strings.Split(line, " ")
+
+	var args []string
+	var current strings.Builder
+	inArg := false
+	inQuote := false
+
+	for _, r := range line {
+		switch {
+		case inQuote:
+			if r == '\'' {
+				inQuote = false
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '\'':
+			inQuote = true
+			inArg = true
+		case r == ' ' || r == '\t':
+			if inArg {
+				args = append(args, current.String())
+				current.Reset()
+				inArg = false
+			}
+		default:
+			current.WriteRune(r)
+			inArg = true
+		}
+	}
+
+	if inArg {
+		args = append(args, current.String())
+	}
 
 	return args , nil
 }
@@ -88,7 +119,7 @@ func handleTYPE(args []string,builtInSet map[string]string) (string, error) {
 		}
 
 		if err != nil {
-			return fmt.Sprintf("Error while visiting file") , err
+			return "Error while visiting file" , err
 		}
 
 		return fmt.Sprintf("%s is %s",args[1],pathAns) , nil
@@ -107,7 +138,7 @@ func handleExecFile(args []string) (string,error) {
 	}
 
 	if err != nil {
-		return fmt.Sprintf("Error while visiting file") , err
+		return "Error while visiting file" , err
 	}
 
 	cmd := exec.Command(args[0],args[1:]...)
@@ -119,7 +150,7 @@ func handleExecFile(args []string) (string,error) {
 	err_cmd := cmd.Run()
 
 	if err_cmd != nil {
-		return fmt.Sprint("Error while executing file.") , err_cmd
+		return "Error while executing file." , err_cmd
 	}
 
 	return "" , nil
@@ -144,6 +175,11 @@ func main() {
 
 		if InputErr != nil {
 			fmt.Print(InputErr)
+		}
+
+		if len(args) == 0 {
+			fmt.Println()
+			continue
 		}
 
 		switch args[0] {
