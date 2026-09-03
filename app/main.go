@@ -174,7 +174,8 @@ func main() {
 		args , InputErr := handleInput(reader)
 
 		if InputErr != nil {
-			fmt.Print(InputErr)
+			fmt.Println(InputErr)
+			return
 		}
 
 		if len(args) == 0 {

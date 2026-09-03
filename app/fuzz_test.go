@@ -34,18 +34,10 @@ func FuzzHandleInput(f *testing.F) {
 	f.Add("\x00\n")
 
 	f.Fuzz(func(t *testing.T, line string) {
-		args, err := handleInput(bufio.NewReader(strings.NewReader(line)))
-
-		// When there is no error there must be usable args, because main
-		// indexes args[0] immediately without checking.
-		if err == nil && len(args) == 0 {
-			t.Fatal(failLine(
-				typed(line),
-				"at least one argument",
-				"no arguments, alongside a nil error",
-				"main indexes args[0] immediately without checking",
-			))
-		}
+		// The contract is simply: parsing must never panic. A blank or
+		// whitespace-only line legitimately produces zero arguments now
+		// that main() guards for that case before indexing args[0].
+		handleInput(bufio.NewReader(strings.NewReader(line)))
 	})
 }
 
