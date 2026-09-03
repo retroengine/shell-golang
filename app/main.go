@@ -23,6 +23,7 @@ func handleInput(reader *bufio.Reader) ([]string , error) {
 	var current strings.Builder
 	inArg := false
 	inQuote := false
+	inDoubleQuote := false
 
 	for _, r := range line {
 		switch {
@@ -32,9 +33,22 @@ func handleInput(reader *bufio.Reader) ([]string , error) {
 			} else {
 				current.WriteRune(r)
 			}
+			
+		case inDoubleQuote:
+			if r == '"' {
+				inDoubleQuote = false
+			} else {
+				current.WriteRune(r)
+			}
+
 		case r == '\'':
-			inQuote = true
-			inArg = true
+				inQuote = true
+				inArg = true
+			
+		case r == '"' :
+				inDoubleQuote = true;
+				inArg  = true
+
 		case r == ' ' || r == '\t':
 			if inArg {
 				args = append(args, current.String())
