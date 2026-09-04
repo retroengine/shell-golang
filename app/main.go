@@ -123,7 +123,7 @@ func handleCD(args []string) error {
 	} else {
 		err := os.Chdir(args[1])
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("cd: %s: No such home directory", args[1])
+			return fmt.Errorf("cd: %s: No such directory", args[1])
 		}
 		if err != nil {
 			return err
