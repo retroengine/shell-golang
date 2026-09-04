@@ -187,6 +187,375 @@ func TestE2E_SingleQuotes_ExternalCommand(t *testing.T) {
 }
 
 // ============================================================
+// double quotes
+// ============================================================
+
+func TestE2E_DoubleQuotes(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "spaces preserved within double quotes",
+			session: "echo \"hello    world\"\n",
+			want:    "hello    world",
+			why:     "spec: consecutive whitespaces (spaces, tabs) must be preserved inside double quotes",
+		},
+		{
+			name:    "adjacent double-quoted strings concatenate",
+			session: "echo \"hello\"\"world\"\n",
+			want:    "helloworld",
+			why:     "spec: double-quoted strings placed next to each other concatenate into one argument",
+		},
+		{
+			name:    "quoted and unquoted text concatenate",
+			session: "echo \"hello\"world\n",
+			want:    "helloworld",
+			why:     "spec: quoted and unquoted strings next to each other also concatenate",
+		},
+		{
+			name:    "separate double-quoted arguments stay distinct",
+			session: "echo \"hello\" \"world\"\n",
+			want:    "hello world",
+			why:     "spec: double-quoted strings are separate arguments unless directly adjacent, so echo joins them back with a single space",
+		},
+		{
+			name:    "single quotes inside double quotes are literal",
+			session: "echo \"shell's test\"\n",
+			want:    "shell's test",
+			why:     "spec: characters lose their special meaning inside double quotes, so the embedded single quote is literal text, not a delimiter",
+		},
+		{
+			name:    "tester case: internal whitespace preserved, quoted args stay distinct",
+			session: "echo \"quz  hello\"  \"bar\"\n",
+			want:    "quz  hello bar",
+			why:     "tester case: internal double-quoted whitespace is preserved and separate quoted arguments remain distinct, joined by echo with one space",
+		},
+		{
+			name:    "tester case: three quoted args, literal apostrophe in one",
+			session: "echo \"bar\"  \"shell's\"  \"foo\"\n",
+			want:    "bar shell's foo",
+			why:     "tester case: three separate double-quoted arguments stay distinct, and the single quote inside one of them is literal, not a delimiter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// double quotes — arguments to external commands
+// ============================================================
+
+func TestE2E_DoubleQuotes_ExternalCommand(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := t.TempDir()
+
+	file1 := filepath.Join(dir, "file name")
+	file2 := filepath.Join(dir, "'file name' with spaces")
+
+	if err := os.WriteFile(file1, []byte("content1 "), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file1, err)
+	}
+	if err := os.WriteFile(file2, []byte("content2"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file2, err)
+	}
+
+	session := fmt.Sprintf("cat \"%s\" \"%s\"\n", file1, file2)
+	want := "content1 content2"
+	why := "spec: double-quoted filenames are passed to external commands as separate arguments, with spaces and literal single quotes inside each name preserved"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+
+// ============================================================
+// backslash inside double quotes
+// ============================================================
+
+func TestE2E_BackslashInDoubleQuotes(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "double backslash inside double quotes collapses to one backslash",
+			session: "echo \"A \\\\\\\\ escapes itself\"\n",
+			want:    "A \\\\ escapes itself",
+			why:     "spec: \\\\\\\\ inside double quotes produces a single literal backslash",
+		},
+		{
+			name:    "backslash-quote inside double quotes produces a literal double quote",
+			session: "echo \"A \\\" inside double quotes\"\n",
+			want:    "A \" inside double quotes",
+			why:     "spec: \\\" inside double quotes escapes the double quote, yielding a literal \"",
+		},
+		{
+			name:    "tester case: mixed single quotes and double-escaped backslash",
+			session: "echo \"just'one'\\\\n'backslash\"\n",
+			want:    "just'one'\\n'backslash",
+			why:     "spec: \\\\\\\\ inside double quotes collapses to \\\\; single quotes inside double quotes are literal",
+		},
+		{
+			name:    "tester case: escaped quote mid-string transitions out of double-quote mode",
+			session: "echo \"inside\\\"literal_quote.\"outside\\\"\n",
+			want:    "inside\"literal_quote.outside\"",
+			why:     "spec: \\\" yields literal \"; the closing unescaped \" ends the quoted span; outside text concatenates; the final \\\" outside adds a literal quote",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// backslash inside double quotes — arguments to external commands
+// ============================================================
+
+func TestE2E_BackslashInDoubleQuotes_ExternalCommand(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	file1 := dir + "/number 1"
+	file2 := dir + "/doublequote \" 2"
+	file3 := dir + "/backslash \\ 3"
+
+	if err := os.WriteFile(file1, []byte("content1"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file1, err)
+	}
+	if err := os.WriteFile(file2, []byte("content2"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file2, err)
+	}
+	if err := os.WriteFile(file3, []byte("content3"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file3, err)
+	}
+
+	// Build session: filenames with special chars are passed using \\" and \\\\ inside double quotes.
+	session := fmt.Sprintf("cat \"%s\" \"%s\" \"%s\"\n",
+		dir+"/number 1",
+		dir+"/doublequote \\\" 2",
+		dir+"/backslash \\\\ 3")
+	want := "content1content2content3"
+	why := "spec: \\\" yields a literal \" and \\\\\\\\ yields a literal \\ inside double quotes, giving the correct filenames to cat"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+// ============================================================
+// backslash outside quotes
+// ============================================================
+
+func TestE2E_Backslash(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "each escaped space is a literal space in one argument",
+			session: `echo three\ \ \ spaces` + "\n",
+			want:    "three" + strings.Repeat(" ", 3) + "spaces",
+			why:     "spec: each \\  creates a literal space as part of one argument",
+		},
+		{
+			name:    "the first space survives escaped, later spaces collapse",
+			session: "echo before\\" + strings.Repeat(" ", 5) + "after\n",
+			want:    "before" + strings.Repeat(" ", 2) + "after",
+			why:     "spec: the backslash preserves the first space literally, but the shell collapses the subsequent unescaped spaces",
+		},
+		{
+			name:    "escaping a regular letter just drops the backslash",
+			session: `echo test\nexample` + "\n",
+			want:    "testnexample",
+			why:     "spec: \\n becomes just n",
+		},
+		{
+			name:    "a backslash can escape a backslash",
+			session: `echo hello\\world` + "\n",
+			want:    `hello\world`,
+			why:     "spec: the first backslash escapes the second, and the result is a single literal backslash",
+		},
+		{
+			name:    "escaping makes single quotes literal characters",
+			session: `echo \'hello\'` + "\n",
+			want:    "'hello'",
+			why:     "spec: \\' makes the single quotes literal characters",
+		},
+		{
+			name:    "tester case: four escaped spaces",
+			session: `echo multiple\ \ \ \ spaces` + "\n",
+			want:    "multiple" + strings.Repeat(" ", 4) + "spaces",
+			why:     "tester case: escaped spaces stay literal inside one argument",
+		},
+		{
+			name:    "tester case: escaped quote characters print literally",
+			session: `echo \'\"literal quotes\"\'` + "\n",
+			want:    `'"literal quotes"'`,
+			why:     "tester case: backslash strips the special meaning from both quote characters, and echo rejoins the resulting words with a single space",
+		},
+		{
+			name:    "tester case: escaping a character with no special meaning",
+			session: `echo ignore\_backslash` + "\n",
+			want:    "ignore_backslash",
+			why:     "tester case: escaping works for characters without special meaning too, the backslash is simply removed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// backslash outside quotes — arguments to external commands
+// ============================================================
+
+func TestE2E_Backslash_ExternalCommand(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	file1 := dir + "/_ignored_1"
+	file2 := dir + "/ignore_2"
+
+	if err := os.WriteFile(file1, []byte("content1 "), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file1, err)
+	}
+	if err := os.WriteFile(file2, []byte("content2"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file2, err)
+	}
+
+	// Backslashes sit only immediately before the character each one
+	// escapes, and the path itself uses forward slashes, so the escaping
+	// never touches a path separator. The tester's third filename needs a
+	// literal backslash character in the name, which can't be created
+	// portably here; that filename's escaping is covered by
+	// TestHandleInput_Backslash_MultipleFileArguments instead.
+	session := fmt.Sprintf("cat %s/\\_ignored_1 %s/ignore_\\2\n", dir, dir)
+	want := "content1 content2"
+	why := "spec: a backslash outside quotes escapes only the single next character, leaving the rest of the path untouched"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+// ============================================================
+// backslash inside single quotes
+// ============================================================
+
+func TestE2E_BackslashInSingleQuotes(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "double backslashes inside single quotes are literal",
+			session: "echo 'multiple\\\\slashes'\n",
+			want:    "multiple\\\\slashes",
+			why:     "spec: backslashes have no escaping behavior inside single quotes, every character is literal",
+		},
+		{
+			name:    "backslash-quote sequences inside single quotes are literal",
+			session: "echo 'every\\\"thing_is\\\"literal'\n",
+			want:    "every\\\"thing_is\\\"literal",
+			why:     "spec: backslashes inside single quotes do not escape double quotes, they are literal text",
+		},
+		{
+			name:    "backslash-n inside single quotes is literal",
+			session: "echo 'shell\\\\\\nscript'\n",
+			want:    "shell\\\\\\nscript",
+			why:     "spec: backslashes have no special escaping behavior inside single quotes, so \\\\\\n remains verbatim",
+		},
+		{
+			name:    "backslash-double-quote inside single quotes is literal",
+			session: "echo 'example\\\"test'\n",
+			want:    "example\\\"test",
+			why:     "spec: a backslash followed by a double quote inside single quotes is literal text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// backslash inside single quotes — arguments to external commands
+// ============================================================
+
+func TestE2E_BackslashInSingleQuotes_ExternalCommand(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	file1 := dir + "/no slash 1"
+	file2 := dir + "/one slash \\2"
+	file3 := dir + "/two slashes \\3\\"
+
+	if err := os.WriteFile(file1, []byte("content1"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file1, err)
+	}
+	if err := os.WriteFile(file2, []byte("content2"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file2, err)
+	}
+	if err := os.WriteFile(file3, []byte("content3"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file3, err)
+	}
+
+	session := fmt.Sprintf("cat '%s' '%s' '%s'\n", file1, file2, file3)
+	want := "content1content2content3"
+	why := "spec: backslashes inside single quotes are literal, so the filenames with backslashes are passed verbatim to cat"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+// ============================================================
 // pwd and cd
 // ============================================================
 

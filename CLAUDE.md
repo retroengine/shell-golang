@@ -66,6 +66,26 @@ For a `_Valid` case, `why` states the spec rule the case demonstrates.
 
 ### Rule 3 — e2e tests go into `e2e_test.go`
 
+### File paths in e2e sessions
+
+When an e2e test needs a real file or directory (for `cat`, `cd`, etc.):
+
+1. Always call `filepath.ToSlash(path)` before embedding the path in a session
+   string — `t.TempDir()` returns backslash paths on Windows, and the shell
+   parser treats `\` as an escape character, corrupting the path silently.
+2. Always wrap the normalised path in single quotes in the session string —
+   this preserves it literally and protects spaces in the path from being
+   split into multiple arguments.
+
+```go
+dir := filepath.ToSlash(t.TempDir())
+session := fmt.Sprintf("cd '%s'\npwd\n", dir)
+```
+
+Without rule 1: `C:\Users\saiki` becomes `C:Userssaiki` inside the shell.
+Without rule 2: `/tmp/dir with spaces` splits into three arguments.
+
+Both rules apply together — always.
 One stage = one block of e2e tests added to `e2e_test.go`.
 
 The block must:
