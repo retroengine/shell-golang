@@ -1403,7 +1403,7 @@ func TestHandleExecFile_Valid(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			call := cmdLine(tt.args)
-			msg, err := handleExecFile(tt.args, "")
+			msg, err := handleExecFile(tt.args, "", 0)
 
 			mustNoErr(t, call, err, tt.why)
 			wantEqual(t, call, msg, "", "a successful run returns an empty message; the output went to stdout")
@@ -1441,7 +1441,7 @@ func TestHandleExecFile_MustFail(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			call := cmdLine(tt.args)
-			msg, err := handleExecFile(tt.args, "")
+			msg, err := handleExecFile(tt.args, "", 0)
 
 			mustErr(t, call, err, tt.why)
 			wantEqual(t, call, msg, tt.wantMsg, tt.why)

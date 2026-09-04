@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -86,25 +87,87 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
-func extractRedirect(args []string) ([]string, string, error) {
+func extractRedirect(args []string) ([]string, string, error, int) {
 	for i, a := range args {
-		if a == ">" || a == "1>" {
-			if i+1 >= len(args) {
-				return nil, "", fmt.Errorf("syntax error: expected file after %s", a)
-			}
-			cleaned := append(append([]string{}, args[:i]...), args[i+2:]...)
-			return cleaned, args[i+1], nil
+		mode := 0
+		switch a {
+		case ">", "1>":
+			mode = 1
+		case "2>":
+			mode = 2
+		case ">>", "1>>":
+			mode = 3
+		case "2>>":
+			mode = 4
 		}
+		if mode == 0 {
+			continue
+		}
+		if i+1 >= len(args) {
+			return nil, "", fmt.Errorf("syntax error: expected file after %s", a), 0
+		}
+		cleaned := append(append([]string{}, args[:i]...), args[i+2:]...)
+		return cleaned, args[i+1], nil, mode
 	}
-	return args, "", nil
+	return args, "", nil, 0
 }
 
-func writeOutput(target, s string) error {
+func writeOutput(target, s string , mode int) error {
+
 	if target == "" {
 		fmt.Println(s)
 		return nil
 	}
-	return os.WriteFile(target, []byte(s+"\n"), 0644)
+
+	if mode == 1 {
+		return os.WriteFile(target, []byte(s+"\n"), 0644)
+	} else {
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		_ , err = f.WriteString(s + "\n")
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func writeError(target string, err error,mode int) error {
+	if err == nil {
+		return nil
+	}
+
+	if target == "" {
+		fmt.Println(err)
+		return nil
+	}
+
+	if mode == 2 {
+		return os.WriteFile(target, []byte(err.Error()+"\n"), 0644)
+	} else {
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		_ , err = f.WriteString(err.Error() + "\n")
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+
 }
 
 func handleEcho(args []string) (string, error) {
@@ -177,7 +240,7 @@ func handleTYPE(args []string, builtInSet map[string]string) (string, error) {
 	}
 }
 
-func handleExecFile(args []string, redirectTarget string) (string, error) {
+func handleExecFile(args []string, redirectTarget string, mode int) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("no command provided")
 	}
@@ -193,19 +256,35 @@ func handleExecFile(args []string, redirectTarget string) (string, error) {
 	}
 
 	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-	if redirectTarget != "" {
-		f, err := os.OpenFile(redirectTarget, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if mode == 1 || mode == 2 || mode == 3 || mode == 4 {
+		flags := os.O_WRONLY | os.O_CREATE
+		if mode == 1 || mode == 2 {
+			flags |= os.O_TRUNC
+		}
+		f, err := os.OpenFile(redirectTarget, flags, 0644)
 		if err != nil {
 			return "", err
 		}
 		defer f.Close()
-		cmd.Stdout = f
-	} else {
-		cmd.Stdout = os.Stdout
+		if mode == 3 || mode == 4 {
+			// child processes inherit this handle; O_APPEND grants only
+			// FILE_APPEND_DATA on Windows, which most child CRTs can't write
+			// through, so seek to EOF on a normally-opened handle instead.
+			if _, err := f.Seek(0, io.SeekEnd); err != nil {
+				return "", err
+			}
+		}
+
+		if mode == 2 || mode == 4 {
+			cmd.Stderr = f
+		} else {
+			cmd.Stdout = f
+		}
 	}
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
 
 	err_cmd := cmd.Run()
 
@@ -228,6 +307,7 @@ func main() {
 		"cd":   "change directory",
 	}
 
+	shellLoop:
 	for {
 		fmt.Print("$ ")
 
@@ -243,7 +323,8 @@ func main() {
 			continue
 		}
 
-		cmdArgs, redirectTarget, redirErr := extractRedirect(args)
+		cmdArgs, redirectTarget, redirErr , mode := extractRedirect(args)
+
 		if redirErr != nil {
 			fmt.Println(redirErr)
 			continue
@@ -252,20 +333,33 @@ func main() {
 
 		switch args[0] {
 		case "exit":
-			break
+			break shellLoop
 		case "echo":
 
 			cleanStr, _ := handleEcho(args)
-			writeOutput(redirectTarget, cleanStr)
+			if mode == 1 || mode == 3 {
+				writeOutput(redirectTarget, cleanStr,mode)
+			} else {
+				fmt.Println(cleanStr)
+			}
 
 		case "pwd":
 			dirName, err := handlePWD(args)
 
 			if err != nil {
-				fmt.Printf("Error printing the working directory %s", err)
+				if mode == 2 || mode == 4{
+					writeError(redirectTarget, err,mode)
+				} else {
+					fmt.Printf("Error printing the working directory %s", err)
+				}
+				break
 			}
 
-			writeOutput(redirectTarget, dirName)
+			if mode == 1 || mode == 3{
+				writeOutput(redirectTarget, dirName, mode)
+			} else {
+				fmt.Println(dirName)
+			}
 
 		case "cd":
 			errCD := handleCD(args)
@@ -275,11 +369,23 @@ func main() {
 			}
 
 		case "type":
-			typeString, _ := handleTYPE(args, builtInSet)
-			writeOutput(redirectTarget, typeString)
+			typeString, err := handleTYPE(args, builtInSet)
+			if err != nil {
+				if mode == 2 || mode == 4{
+					writeError(redirectTarget, err,mode)
+				} else {
+					fmt.Print(err)
+				}
+				break
+			}
+			if mode == 1 || mode == 3 {
+				writeOutput(redirectTarget, typeString,mode)
+			} else {
+				fmt.Println(typeString)
+			}
 
 		default:
-			msg, err := handleExecFile(args, redirectTarget)
+			msg, err := handleExecFile(args, redirectTarget, mode)
 
 			if msg != "" || err != nil {
 				fmt.Print(err)
