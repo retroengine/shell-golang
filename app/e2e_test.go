@@ -341,34 +341,30 @@ func TestE2E_BackslashInDoubleQuotes_ExternalCommand(t *testing.T) {
 	binary := buildTestBinary(t)
 	dir := filepath.ToSlash(t.TempDir())
 
+	// The two escapes double quotes recognize (\" and \\) both target
+	// characters (" and \) that are illegal inside a Windows filename
+	// component, so a real file exercising either escape cannot be created
+	// portably here. That escaping is covered instead by
+	// TestHandleInput_BackslashInDoubleQuotes_MultipleFileArguments, which
+	// asserts on the parsed argument directly without touching the
+	// filesystem. This test only proves a double-quoted filename with a
+	// plain space reaches an external command unharmed.
 	file1 := dir + "/number 1"
-	file2 := dir + "/doublequote \" 2"
-	file3 := dir + "/backslash \\ 3"
 
 	if err := os.WriteFile(file1, []byte("content1"), 0o644); err != nil {
 		t.Fatalf("setup: cannot create %q: %v", file1, err)
 	}
-	if err := os.WriteFile(file2, []byte("content2"), 0o644); err != nil {
-		t.Fatalf("setup: cannot create %q: %v", file2, err)
-	}
-	if err := os.WriteFile(file3, []byte("content3"), 0o644); err != nil {
-		t.Fatalf("setup: cannot create %q: %v", file3, err)
-	}
 
-	// Build session: filenames with special chars are passed using \\" and \\\\ inside double quotes.
-	session := fmt.Sprintf("cat \"%s\" \"%s\" \"%s\"\n",
-		dir+"/number 1",
-		dir+"/doublequote \\\" 2",
-		dir+"/backslash \\\\ 3")
-	want := "content1content2content3"
-	why := "spec: \\\" yields a literal \" and \\\\\\\\ yields a literal \\ inside double quotes, giving the correct filenames to cat"
+	session := fmt.Sprintf("cat \"%s\"\n", file1)
+	want := "content1"
+	why := "spec: double quotes preserve the space in the filename, so it reaches cat as one argument"
 
 	got := runShell(t, binary, session)
 	assertContainsWhy(t, session, got, want, why)
 }
 
 // ============================================================
-// backslash outside quotes
+// handleInput — backslash outside quotes
 // ============================================================
 
 func TestE2E_Backslash(t *testing.T) {
@@ -533,23 +529,23 @@ func TestE2E_BackslashInSingleQuotes_ExternalCommand(t *testing.T) {
 	binary := buildTestBinary(t)
 	dir := filepath.ToSlash(t.TempDir())
 
+	// A backslash inside single quotes is passed through completely
+	// literally, so exercising it here would require a real filename
+	// containing a \ character, which is illegal inside a Windows filename
+	// component. That case is covered instead by
+	// TestHandleInput_BackslashInSingleQuotes_MultipleFileArguments, which
+	// asserts on the parsed argument directly without touching the
+	// filesystem. This test only proves a single-quoted filename with a
+	// plain space reaches an external command unharmed.
 	file1 := dir + "/no slash 1"
-	file2 := dir + "/one slash \\2"
-	file3 := dir + "/two slashes \\3\\"
 
 	if err := os.WriteFile(file1, []byte("content1"), 0o644); err != nil {
 		t.Fatalf("setup: cannot create %q: %v", file1, err)
 	}
-	if err := os.WriteFile(file2, []byte("content2"), 0o644); err != nil {
-		t.Fatalf("setup: cannot create %q: %v", file2, err)
-	}
-	if err := os.WriteFile(file3, []byte("content3"), 0o644); err != nil {
-		t.Fatalf("setup: cannot create %q: %v", file3, err)
-	}
 
-	session := fmt.Sprintf("cat '%s' '%s' '%s'\n", file1, file2, file3)
-	want := "content1content2content3"
-	why := "spec: backslashes inside single quotes are literal, so the filenames with backslashes are passed verbatim to cat"
+	session := fmt.Sprintf("cat '%s'\n", file1)
+	want := "content1"
+	why := "spec: single quotes preserve the space in the filename, so it reaches cat as one argument"
 
 	got := runShell(t, binary, session)
 	assertContainsWhy(t, session, got, want, why)
@@ -575,8 +571,10 @@ func TestE2E_CD_ThenPWD(t *testing.T) {
 	binary := buildTestBinary(t)
 	tmp := t.TempDir()
 
-	session := fmt.Sprintf("cd %s\npwd\n", tmp)
+	session := fmt.Sprintf("cd '%s'\npwd\n", filepath.ToSlash(tmp))
 	got := runShell(t, binary, session)
+	// pwd reports the OS-native path, so assert against tmp (native
+	// separators), not the forward-slash form used to type the session.
 	assertContains(t, session, got, tmp)
 }
 
@@ -702,6 +700,78 @@ func TestE2E_PromptIsPrinted(t *testing.T) {
 	session := "echo hi\n"
 	got := runShell(t, binary, session)
 	assertContains(t, session, got, "$ ")
+}
+
+// ============================================================
+// quoted executable names
+// ============================================================
+
+func TestE2E_QuotedExecutable(t *testing.T) {
+	catPath, err := exec.LookPath("cat")
+	if err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	// A double-quote character is illegal inside a Windows filename
+	// component, so a real executable named `exe with "quotes"` cannot be
+	// created portably here. That case (single-quoted name with an
+	// embedded double quote) is covered instead by
+	// TestHandleInput_QuotedExecutable_Valid, which asserts on the parsed
+	// argument directly without touching the filesystem. This test copies
+	// only the double-quoted-name-with-embedded-single-quotes variant,
+	// since a single quote is a legal Windows filename character.
+	exeName := `exe with 'single quotes'`
+
+	copyExe := func(dst string) {
+		// Windows will only resolve an extensionless name on PATH via
+		// PATHEXT if the file on disk actually carries one of those
+		// extensions, so the copy needs a real .exe suffix even though the
+		// shell session below invokes it without one.
+		if runtime.GOOS == "windows" {
+			dst += ".exe"
+		}
+		data, err := os.ReadFile(catPath)
+		if err != nil {
+			t.Fatalf("setup: cannot read cat binary: %v", err)
+		}
+		if err := os.WriteFile(dst, data, 0o755); err != nil {
+			t.Fatalf("setup: cannot write %q: %v", dst, err)
+		}
+	}
+
+	copyExe(dir + "/" + exeName)
+
+	file := dir + "/file.txt"
+	if err := os.WriteFile(file, []byte("content"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	// Prepend the temp dir to PATH so the shell can find the renamed binary.
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "double-quoted executable name with embedded single quotes",
+			session: fmt.Sprintf("\"exe with 'single quotes'\" %s\n", file),
+			want:    "content",
+			why:     "spec: double quotes strip the quotes and yield the literal name exe with 'single quotes', which is found on PATH and executed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
 }
 
 // ============================================================

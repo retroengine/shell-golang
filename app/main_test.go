@@ -577,6 +577,92 @@ func TestHandleInput_BackslashInDoubleQuotes_MultipleFileArguments(t *testing.T)
 }
 
 // ============================================================
+// handleInput — quoted executable names
+// ============================================================
+
+func TestHandleInput_QuotedExecutable_Valid(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+		why   string
+	}{
+		{
+			name:  "single-quoted executable with embedded double quotes",
+			input: `'exe with "quotes"' file` + "\n",
+			want:  []string{`exe with "quotes"`, "file"},
+			why:   `spec: single quotes strip the delimiters and preserve the interior literally, including double-quote characters, giving args[0] = exe with "quotes"`,
+		},
+		{
+			name:  "double-quoted executable with embedded single quotes",
+			input: "\"exe with 'single quotes'\" file\n",
+			want:  []string{"exe with 'single quotes'", "file"},
+			why:   "spec: double quotes strip the delimiters and preserve the interior literally, including single-quote characters, giving args[0] = exe with 'single quotes'",
+		},
+		{
+			name:  "single-quoted executable with space in name",
+			input: "'my program' argument1\n",
+			want:  []string{"my program", "argument1"},
+			why:   "spec: single quotes preserve the space inside the name, so the executable is one token: my program",
+		},
+		{
+			name:  "double-quoted executable with space in name",
+			input: "\"exe with spaces\" file.txt\n",
+			want:  []string{"exe with spaces", "file.txt"},
+			why:   "spec: double quotes preserve the space inside the name, so the executable is one token: exe with spaces",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
+			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
+
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleInput_QuotedExecutable_Edge(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+		why   string
+	}{
+		{
+			name:  "quoted executable with no arguments",
+			input: "'my program'\n",
+			want:  []string{"my program"},
+			why:   "spec: a quoted executable with no arguments still produces a single-element arg list",
+		},
+		{
+			name:  "quoted executable adjacent to unquoted text forms one token",
+			input: "'my'program arg\n",
+			want:  []string{"myprogram", "arg"},
+			why:   "spec: a quoted segment adjacent to unquoted text concatenates into a single token, even in the command position",
+		},
+		{
+			name:  "multiple quoted segments concatenate into one executable name",
+			input: "'exe'\" with\"' spaces' arg\n",
+			want:  []string{"exe with spaces", "arg"},
+			why:   "spec: adjacent quoted segments in the command position concatenate into a single executable name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.input)
+			got, err := handleInput(bufio.NewReader(strings.NewReader(tt.input)))
+
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
 // handleInput — backslash outside quotes
 // ============================================================
 

@@ -25,20 +25,10 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 	inQuote := false
 	inDoubleQuote := false
 	slash := false
-	dquoteSlash := false
+	pendingEscape := false
 
 	for _, r := range line {
 		switch {
-		case dquoteSlash:
-			// Inside double quotes after a backslash:
-			// \\ → literal \, \" → literal ", anything else → keep both \ and the char.
-			if r == '\\' || r == '"' {
-				current.WriteRune(r)
-			} else {
-				current.WriteRune('\\')
-				current.WriteRune(r)
-			}
-			dquoteSlash = false
 		case slash:
 			current.WriteRune(r)
 			slash = false
@@ -51,13 +41,23 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 			}
 
 		case inDoubleQuote:
-			if r == '"' {
+			switch {
+			case pendingEscape:
+				pendingEscape = false
+				if r == '"' || r == '\\' {
+					current.WriteRune(r)
+				} else {
+					current.WriteRune('\\')
+					current.WriteRune(r)
+				}
+			case r == '"':
 				inDoubleQuote = false
-			} else if r == '\\' {
-				dquoteSlash = true
-			} else {
+			case r == '\\':
+				pendingEscape = true
+			default:
 				current.WriteRune(r)
 			}
+
 		case r == '\'':
 			inQuote = true
 			inArg = true
