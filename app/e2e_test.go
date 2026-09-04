@@ -875,6 +875,212 @@ func TestE2E_StdoutRedirection_ErrorNotRedirected(t *testing.T) {
 }
 
 // ============================================================
+// stdout append (>> and 1>>)
+// ============================================================
+
+func TestE2E_StdoutAppend(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    ">> creates the file if it does not exist and writes stdout into it",
+			session: fmt.Sprintf("echo first >> '%s/created.txt'\ncat '%s/created.txt'\n", dir, dir),
+			want:    "first",
+			why:     "spec: if the file doesn't exist, it is created, just like >",
+		},
+		{
+			name:    "1>> behaves identically to >>",
+			session: fmt.Sprintf("echo Hello Emily 1>> '%s/onegt.txt'\necho Hello Maria 1>> '%s/onegt.txt'\ncat '%s/onegt.txt'\n", dir, dir, dir),
+			want:    "Hello Emily\nHello Maria",
+			why:     "spec: 1>> and >> do exactly the same thing",
+		},
+		{
+			name:    "appended output from an external command follows what > wrote before it",
+			session: fmt.Sprintf("echo List of files: > '%s/mixed.txt'\ngo version >> '%s/mixed.txt'\ncat '%s/mixed.txt'\n", dir, dir, dir),
+			want:    "List of files:\ngo version",
+			why:     "spec: >> redirects the standard output of a command to a file, whether the command is a builtin or an external program, without disturbing what was already there",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestE2E_StdoutAppend_PreservesExistingContent(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	file := dir + "/existing.txt"
+
+	// A trailing newline mirrors how a real file (one line ended with echo,
+	// or a text editor's save) normally looks; >> just resumes writing at
+	// EOF, it does not insert a separator, so seeding without one would
+	// merge onto the last line rather than proving append landed on a new one.
+	if err := os.WriteFile(filepath.FromSlash(file), []byte("old contents\n"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	session := fmt.Sprintf("echo new contents >> '%s'\ncat '%s'\n", file, file)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "old contents\nnew contents",
+		"spec: unlike >, which overwrites the file, >> adds the output to the end of the file and preserves any existing content")
+
+	data, err := os.ReadFile(filepath.FromSlash(file))
+	if err != nil {
+		t.Fatalf("setup: cannot read back %q: %v", file, err)
+	}
+	wantEqual(t, typedSession(session), strings.TrimRight(string(data), "\r\n"), "old contents\nnew contents",
+		"spec: the file's old contents are kept, with the new output added after them")
+}
+
+// ============================================================
+// stderr append (2>>)
+// ============================================================
+
+func TestE2E_StderrAppend(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	session := fmt.Sprintf("cat '%s/nonexistent' 2>> '%s/errors.txt'\ncat '%s/errors.txt'\n", dir, dir, dir)
+	want := "nonexistent"
+	why := "spec: if the file doesn't exist, it is created, and the command's standard error is written into it"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+func TestE2E_StderrAppend_PreservesExistingContent(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	session := fmt.Sprintf("cat '%s/nonexistent1' 2>> '%s/errors.txt'\ncat '%s/nonexistent2' 2>> '%s/errors.txt'\ncat '%s/errors.txt'\n",
+		dir, dir, dir, dir, dir)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "nonexistent1",
+		"spec: unlike 2>, which overwrites the file, 2>> preserves the first command's error instead of losing it to the second")
+	assertContainsWhy(t, session, got, "nonexistent2",
+		"spec: the second command's error is added to the end of the file, after the first")
+}
+
+func TestE2E_StderrAppend_StdoutNotRedirected(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	existing := dir + "/blueberry"
+	if err := os.WriteFile(filepath.FromSlash(existing), []byte("blueberry"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", existing, err)
+	}
+
+	outFile := dir + "/quz.md"
+	session := fmt.Sprintf("cat '%s' nonexistent 2>> '%s'\ncat '%s'\n", existing, outFile, outFile)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "blueberry",
+		"spec: standard output still appears on the terminal (not redirected) when only stderr is sent to a file")
+
+	data, err := os.ReadFile(filepath.FromSlash(outFile))
+	if err != nil {
+		t.Fatalf("setup: cannot read back %q: %v", outFile, err)
+	}
+	if strings.Contains(string(data), "blueberry") {
+		t.Error(failLine(typedSession(session), "no stdout content", show(string(data)),
+			"spec: only the command's standard error is appended to the file, not its standard output"))
+	} else {
+		t.Logf("%s %s\n    expected: no stdout content\n    received: %s", markPass, typedSession(session), show(string(data)))
+	}
+}
+
+// ============================================================
+// tab autocompletion
+// ============================================================
+
+func TestE2E_TabAutocomplete(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "ech<TAB> completes to echo, ready for an argument",
+			session: "ech\tworld\n",
+			want:    "world",
+			why:     "spec: ech<TAB> completes to echo with a trailing space, so typing world afterwards becomes its argument, not part of the command name",
+		},
+		{
+			name:    "exi<TAB> completes to exit, shell exits without a 'not found' error",
+			session: "exi\textra\n",
+			want:    "not found",
+			why:     "spec: exi<TAB> completes to exit (with a trailing space) so the line runs the exit builtin and terminates cleanly, rather than the concatenated word exitextra failing to resolve",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			if tt.name == "exi<TAB> completes to exit, shell exits without a 'not found' error" {
+				if strings.Contains(got, tt.want) {
+					t.Error(failLine(typedSession(tt.session), "no \"not found\" error", got, tt.why))
+				} else {
+					t.Logf("%s %s\n    expected: no \"not found\" error\n    received: %s", markPass, typedSession(tt.session), show(got))
+				}
+				return
+			}
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// tab autocompletion — invalid completions
+// ============================================================
+
+func TestE2E_TabAutocomplete_NoMatch(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	session := "xyz\t\n"
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "\x07",
+		"spec: pressing <TAB> with no matching completion rings the bell (\\x07)")
+	assertContainsWhy(t, session, got, "xyz",
+		"spec: input is left unchanged when no completion is possible, so the unmatched word still reaches the command line")
+}
+
+// ============================================================
 // helpers
 // ============================================================
 

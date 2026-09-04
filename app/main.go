@@ -9,10 +9,89 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/term"
 )
 
+// The words <TAB> is allowed to complete.
+var autocompleteCommands = []string{"echo", "exit"}
+
+// handleAutocomplete returns partial's match completed with a trailing space, or "" if none match.
+func handleAutocomplete(partial string) string {
+	if partial == "" {
+		return ""
+	}
+	for _, cmd := range autocompleteCommands {
+		if strings.HasPrefix(cmd, partial) {
+			return cmd + " "
+		}
+	}
+	return ""
+}
+
+// isBareCommandPrefix reports whether input is still just the bare command name (no space/quote/backslash yet).
+func isBareCommandPrefix(input []byte) bool {
+	return !strings.ContainsAny(string(input), " \t'\"\\")
+}
+
+// readLine reads one line byte-by-byte instead of up to '\n', so <TAB> can be caught the instant it's typed.
+func readLine(reader *bufio.Reader) (string, error) {
+	fd := int(os.Stdin.Fd())
+	isTerm := term.IsTerminal(fd)
+
+	if isTerm {
+		// Real terminal: switch to raw mode so we get every keystroke immediately instead of a whole buffered line.
+		oldState, err := term.MakeRaw(fd)
+		if err != nil {
+			isTerm = false
+		} else {
+			defer term.Restore(fd, oldState) // restore normal terminal settings once we return
+		}
+	}
+
+	var input []byte // the line, built up one byte at a time
+
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return string(input), err // stdin closed / read failed
+		}
+
+		switch b {
+		case '\r', '\n': // Enter
+			if isTerm {
+				fmt.Print("\r\n")
+			}
+			return string(input), nil
+
+		case 127, 8: // Backspace
+			if len(input) > 0 {
+				input = input[:len(input)-1]
+			}
+
+		case '\t': // Tab: complete, ring the bell if there's no match, else treat as a literal tab
+			if isBareCommandPrefix(input) {
+				if completed := handleAutocomplete(string(input)); completed != "" {
+					input = []byte(completed)
+				} else {
+					fmt.Print("\x07") // no completion possible: leave input unchanged, sound the bell
+				}
+			} else {
+				input = append(input, b)
+			}
+
+		default: // ordinary character
+			input = append(input, b)
+		}
+
+		if isTerm {
+			fmt.Printf("\r\033[K$ %s", string(input)) // redraw the prompt line to reflect the edit
+		}
+	}
+}
+
 func handleInput(reader *bufio.Reader) ([]string, error) {
-	line, err := reader.ReadString('\n')
+	line, err := readLine(reader)
 
 	if err != nil {
 		return nil, fmt.Errorf("Unable to read Input")

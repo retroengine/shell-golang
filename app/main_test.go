@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -960,6 +961,128 @@ func TestHandleInput_BackslashInSingleQuotes_MultipleFileArguments(t *testing.T)
 }
 
 // ============================================================
+// extractRedirect — output/error redirection operators
+// ============================================================
+
+func TestExtractRedirect_Valid(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantArgs   []string
+		wantTarget string
+		wantMode   int
+		why        string
+	}{
+		{
+			name:       "> redirects stdout, overwriting the file",
+			args:       []string{"echo", "hi", ">", "out.txt"},
+			wantArgs:   []string{"echo", "hi"},
+			wantTarget: "out.txt",
+			wantMode:   1,
+			why:        "spec: > sends standard output to the named file, replacing its contents",
+		},
+		{
+			name:       "1> behaves identically to >",
+			args:       []string{"echo", "hi", "1>", "out.txt"},
+			wantArgs:   []string{"echo", "hi"},
+			wantTarget: "out.txt",
+			wantMode:   1,
+			why:        "spec: 1 is the file descriptor for standard output, so 1> and > do exactly the same thing",
+		},
+		{
+			name:       "2> redirects stderr, overwriting the file",
+			args:       []string{"cat", "missing", "2>", "err.txt"},
+			wantArgs:   []string{"cat", "missing"},
+			wantTarget: "err.txt",
+			wantMode:   2,
+			why:        "spec: 2> sends standard error to the named file, replacing its contents",
+		},
+		{
+			name:       ">> redirects stdout, appending to the file",
+			args:       []string{"echo", "hi", ">>", "out.txt"},
+			wantArgs:   []string{"echo", "hi"},
+			wantTarget: "out.txt",
+			wantMode:   3,
+			why:        "spec: >> appends standard output to the file instead of overwriting it",
+		},
+		{
+			name:       "1>> behaves identically to >>",
+			args:       []string{"echo", "hi", "1>>", "out.txt"},
+			wantArgs:   []string{"echo", "hi"},
+			wantTarget: "out.txt",
+			wantMode:   3,
+			why:        "spec: 1>> and >> do exactly the same thing",
+		},
+		{
+			name:       "2>> redirects stderr, appending to the file",
+			args:       []string{"cat", "missing", "2>>", "err.txt"},
+			wantArgs:   []string{"cat", "missing"},
+			wantTarget: "err.txt",
+			wantMode:   4,
+			why:        "spec: 2>> appends standard error to the file instead of overwriting it",
+		},
+		{
+			name:       "no redirection operator present",
+			args:       []string{"echo", "hi"},
+			wantArgs:   []string{"echo", "hi"},
+			wantTarget: "",
+			wantMode:   0,
+			why:        "a command with no >, 1>, 2>, >>, 1>>, or 2>> is passed through untouched, with mode 0 meaning no redirect",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			gotArgs, gotTarget, err, gotMode := extractRedirect(tt.args)
+
+			mustNoErr(t, call, err, tt.why)
+			wantArgs(t, call, gotArgs, tt.wantArgs, tt.why)
+			wantEqual(t, call, gotTarget, tt.wantTarget, tt.why)
+			wantEqual(t, call, fmt.Sprintf("%d", gotMode), fmt.Sprintf("%d", tt.wantMode), tt.why)
+		})
+	}
+}
+
+func TestExtractRedirect_MustFail(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantContain string
+		why         string
+	}{
+		{
+			name:        "> with no filename after it",
+			args:        []string{"echo", "hi", ">"},
+			wantContain: "syntax error",
+			why:         "a redirection operator must be followed by a target file",
+		},
+		{
+			name:        ">> with no filename after it",
+			args:        []string{"echo", "hi", ">>"},
+			wantContain: "syntax error",
+			why:         "a redirection operator must be followed by a target file",
+		},
+		{
+			name:        "2>> with no filename after it",
+			args:        []string{"cat", "missing", "2>>"},
+			wantContain: "syntax error",
+			why:         "a redirection operator must be followed by a target file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			_, _, err, _ := extractRedirect(tt.args)
+
+			mustErr(t, call, err, tt.why)
+			wantErrContains(t, call, err, tt.wantContain, tt.why)
+		})
+	}
+}
+
+// ============================================================
 // handleEcho
 // ============================================================
 
@@ -1445,6 +1568,106 @@ func TestHandleExecFile_MustFail(t *testing.T) {
 
 			mustErr(t, call, err, tt.why)
 			wantEqual(t, call, msg, tt.wantMsg, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handleAutocomplete — tab completion for echo/exit
+// ============================================================
+
+func TestHandleAutocomplete_Valid(t *testing.T) {
+	tests := []struct {
+		name    string
+		partial string
+		want    string
+		why     string
+	}{
+		{
+			name:    "ech completes to echo with a trailing space",
+			partial: "ech",
+			want:    "echo ",
+			why:     "spec: ech<TAB> completes to echo (with a space at the end)",
+		},
+		{
+			name:    "exi completes to exit with a trailing space",
+			partial: "exi",
+			want:    "exit ",
+			why:     "spec: exi<TAB> completes to exit (with a space at the end)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.partial)
+			got := handleAutocomplete(tt.partial)
+
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleAutocomplete_Edge(t *testing.T) {
+	tests := []struct {
+		name    string
+		partial string
+		want    string
+		why     string
+	}{
+		{
+			name:    "empty partial does not complete",
+			partial: "",
+			want:    "",
+			why:     "spec gives no rule for completing on nothing typed, so an empty prefix should not silently pick a builtin",
+		},
+		{
+			name:    "exact match still gets a trailing space",
+			partial: "echo",
+			want:    "echo ",
+			why:     "spec: completion adds a trailing space so the user can immediately type arguments, even if the word was already complete",
+		},
+		{
+			name:    "no builtin starts with this prefix",
+			partial: "xyz",
+			want:    "",
+			why:     "spec: only echo and exit are completed; anything else has no match",
+		},
+		{
+			name:    "prefix longer than any builtin does not match",
+			partial: "echotail",
+			want:    "",
+			why:     "a partial that has already overrun every builtin's length cannot be a prefix of one",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.partial)
+			got := handleAutocomplete(tt.partial)
+
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleAutocomplete_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		partial string
+	}{
+		{name: "empty string", partial: ""},
+		{name: "whitespace", partial: "   "},
+		{name: "unbalanced quote", partial: "'"},
+		{name: "unicode", partial: "éx"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.partial)
+			// handleAutocomplete has no error return; this just proves it
+			// returns cleanly (no panic) for input outside the happy path.
+			_ = handleAutocomplete(tt.partial)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
 		})
 	}
 }
