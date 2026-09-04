@@ -86,6 +86,27 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
+func extractRedirect(args []string) ([]string, string, error) {
+	for i, a := range args {
+		if a == ">" || a == "1>" {
+			if i+1 >= len(args) {
+				return nil, "", fmt.Errorf("syntax error: expected file after %s", a)
+			}
+			cleaned := append(append([]string{}, args[:i]...), args[i+2:]...)
+			return cleaned, args[i+1], nil
+		}
+	}
+	return args, "", nil
+}
+
+func writeOutput(target, s string) error {
+	if target == "" {
+		fmt.Println(s)
+		return nil
+	}
+	return os.WriteFile(target, []byte(s+"\n"), 0644)
+}
+
 func handleEcho(args []string) (string, error) {
 	if len(args) == 0 {
 		return "", nil
@@ -156,7 +177,7 @@ func handleTYPE(args []string, builtInSet map[string]string) (string, error) {
 	}
 }
 
-func handleExecFile(args []string) (string, error) {
+func handleExecFile(args []string, redirectTarget string) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("no command provided")
 	}
@@ -173,7 +194,16 @@ func handleExecFile(args []string) (string, error) {
 
 	cmd := exec.Command(args[0], args[1:]...)
 
-	cmd.Stdout = os.Stdout
+	if redirectTarget != "" {
+		f, err := os.OpenFile(redirectTarget, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		cmd.Stdout = f
+	} else {
+		cmd.Stdout = os.Stdout
+	}
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 
@@ -213,13 +243,20 @@ func main() {
 			continue
 		}
 
+		cmdArgs, redirectTarget, redirErr := extractRedirect(args)
+		if redirErr != nil {
+			fmt.Println(redirErr)
+			continue
+		}
+		args = cmdArgs
+
 		switch args[0] {
 		case "exit":
 			break
 		case "echo":
 
 			cleanStr, _ := handleEcho(args)
-			fmt.Println(cleanStr)
+			writeOutput(redirectTarget, cleanStr)
 
 		case "pwd":
 			dirName, err := handlePWD(args)
@@ -228,7 +265,7 @@ func main() {
 				fmt.Printf("Error printing the working directory %s", err)
 			}
 
-			fmt.Println(dirName)
+			writeOutput(redirectTarget, dirName)
 
 		case "cd":
 			errCD := handleCD(args)
@@ -239,18 +276,16 @@ func main() {
 
 		case "type":
 			typeString, _ := handleTYPE(args, builtInSet)
-
-			fmt.Print(typeString)
+			writeOutput(redirectTarget, typeString)
 
 		default:
-			msg, err := handleExecFile(args)
+			msg, err := handleExecFile(args, redirectTarget)
 
 			if msg != "" || err != nil {
 				fmt.Print(err)
 			}
 
 		}
-
 		fmt.Println()
 	}
 }

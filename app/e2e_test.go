@@ -281,7 +281,6 @@ func TestE2E_DoubleQuotes_ExternalCommand(t *testing.T) {
 	assertContainsWhy(t, session, got, want, why)
 }
 
-
 // ============================================================
 // backslash inside double quotes
 // ============================================================
@@ -772,6 +771,107 @@ func TestE2E_QuotedExecutable(t *testing.T) {
 			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
 		})
 	}
+}
+
+// ============================================================
+// stdout redirection (> and 1>)
+// ============================================================
+
+func TestE2E_StdoutRedirection(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "> creates the file if it does not exist and writes stdout into it",
+			session: fmt.Sprintf("echo hello > '%s/output.txt'\ncat '%s/output.txt'\n", dir, dir),
+			want:    "hello",
+			why:     "spec: if the file doesn't exist, it is created; the output that would normally appear on the terminal is written to it instead",
+		},
+		{
+			name:    "1> behaves identically to >",
+			session: fmt.Sprintf("echo Hello James 1> '%s/foo.md'\ncat '%s/foo.md'\n", dir, dir),
+			want:    "Hello James",
+			why:     "spec: 1 is the file descriptor for standard output, so 1> and > do exactly the same thing",
+		},
+		{
+			name:    "redirected output from an external command",
+			session: fmt.Sprintf("go version > '%s/version.txt'\ncat '%s/version.txt'\n", dir, dir),
+			want:    "go version",
+			why:     "spec: > redirects the standard output of a command to a file, whether the command is a builtin or an external program",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestE2E_StdoutRedirection_Overwrites(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	file := dir + "/existing.txt"
+
+	if err := os.WriteFile(filepath.FromSlash(file), []byte("old contents"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	session := fmt.Sprintf("echo new contents > '%s'\ncat '%s'\n", file, file)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "new contents",
+		"spec: if the file already exists, it is overwritten, replacing its old contents")
+
+	data, err := os.ReadFile(filepath.FromSlash(file))
+	if err != nil {
+		t.Fatalf("setup: cannot read back %q: %v", file, err)
+	}
+	wantEqual(t, typedSession(session), strings.TrimRight(string(data), "\r\n"), "new contents",
+		"spec: the file's old contents are replaced, not appended to")
+}
+
+func TestE2E_StdoutRedirection_ErrorNotRedirected(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	existing := dir + "/blueberry"
+	if err := os.WriteFile(filepath.FromSlash(existing), []byte("blueberry"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", existing, err)
+	}
+
+	outFile := dir + "/quz.md"
+	session := fmt.Sprintf("cat '%s' nonexistent 1> '%s'\ncat '%s'\n", existing, outFile, outFile)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "blueberry",
+		"spec: the non-error output from cat still reaches the redirected file")
+
+	data, err := os.ReadFile(filepath.FromSlash(outFile))
+	if err != nil {
+		t.Fatalf("setup: cannot read back %q: %v", outFile, err)
+	}
+	wantEqual(t, typedSession(session), strings.TrimRight(string(data), "\r\n"), "blueberry",
+		"spec: error messages are not written to the redirected file, only the command's standard output is")
 }
 
 // ============================================================
