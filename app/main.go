@@ -82,8 +82,7 @@ func handleAutoCompleteExe(partial string) (string, error) {
 	return matches[0] + " ", nil
 }
 
-// longestCommonPrefix returns the longest prefix shared by every string in
-// strs. strs must be non-empty.
+// longestCommonPrefix returns the longest prefix shared by every string in strs (strs must be non-empty).
 func longestCommonPrefix(strs []string) string {
 	prefix := strs[0]
 	for _, s := range strs[1:] {
@@ -94,6 +93,7 @@ func longestCommonPrefix(strs []string) string {
 	return prefix
 }
 
+// isBareCommandPrefix reports whether input is still a single word (no space, quote, or backslash yet).
 func isBareCommandPrefix(input []byte) bool {
 	return !strings.ContainsAny(string(input), " \t'\"\\")
 }
@@ -140,10 +140,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 			}
 
 		case '\t':
-			// Tab: complete on an unambiguous match, ring the bell on no match or on
-			// the first press of an ambiguous one, list every match on the second
-			// press, then cycle through that list (Windows/PowerShell-style) on every
-			// press after that, until some other key breaks out of the cycle.
+			// Tab: complete an unambiguous match, bell on no/first-ambiguous match, list on the 2nd press, then cycle (PowerShell-style) after that.
 			if !isBareCommandPrefix(input) {
 				consecutiveTabs = 0
 				cycleMatches = nil
@@ -169,26 +166,25 @@ func readLine(reader *bufio.Reader) (string, error) {
 			matches := matchingExecutables(string(input))
 			switch len(matches) {
 			case 0:
-				fmt.Print("\x07") // no completion possible: leave input unchanged, sound the bell
+				fmt.Print("\x07") // \x07 is the ASCII BEL char, beeps the terminal; no match, input unchanged
 				consecutiveTabs = 0
 			case 1:
 				input = []byte(matches[0] + " ")
 				consecutiveTabs = 0
 			default: // 2+ matches
 				if lcp := longestCommonPrefix(matches); len(lcp) > len(input) {
-					// Matches share more prefix than what's typed so far: complete
-					// as far as that shared prefix, no bell/list/cycle needed yet.
-					input = []byte(lcp)
+					input = []byte(lcp) // matches share a longer prefix than what's typed: complete up to it, no bell/list yet
 					consecutiveTabs = 0
 					break
 				}
 
 				if consecutiveTabs < 2 {
-					fmt.Print("\x07") // first tab on an ambiguous prefix: bell only, leave input unchanged
+					fmt.Print("\x07") // \x07 (BEL): first tab on an ambiguous prefix just beeps, input unchanged
 					break
 				}
 
 				if isTerm {
+					// \r\n = drop to a fresh line, \033[K = ANSI "erase to end of line", then redraw "$ " + input below the listed matches
 					fmt.Printf("\r\n%s\r\n\033[K$ %s", strings.Join(matches, "  "), string(input))
 				} else {
 					fmt.Printf("\n%s\n$ %s", strings.Join(matches, "  "), string(input))
@@ -206,7 +202,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 		}
 
 		if isTerm {
-			fmt.Printf("\r\033[K$ %s", string(input)) // redraw the prompt line to reflect the edit
+			fmt.Printf("\r\033[K$ %s", string(input)) // \r = cursor to line start, \033[K = erase it, then redraw "$ " + input
 		}
 	}
 }
@@ -287,6 +283,7 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
+// extractRedirect pulls a trailing redirect operator out of args; mode is 1=stdout truncate, 2=stderr truncate, 3=stdout append, 4=stderr append.
 func extractRedirect(args []string) ([]string, string, error, int) {
 	for i, a := range args {
 		mode := 0
@@ -312,13 +309,10 @@ func extractRedirect(args []string) ([]string, string, error, int) {
 	return args, "", nil, 0
 }
 
-// stdoutIsTerm is true only when stdout is a real console, not a pipe (as in
-// the e2e tests, which expect plain "\n" output).
+// stdoutIsTerm is true only when stdout is a real console, not a pipe (as in the e2e tests, which expect plain "\n" output).
 var stdoutIsTerm = term.IsTerminal(int(os.Stdout.Fd()))
 
-// printLine writes s followed by a line ending. On a real terminal that's
-// "\r\n": fmt.Println's bare "\n" is not translated to "\r\n" on Windows,
-// which staircases every line one column further right than the last.
+// printLine prints s plus "\r\n" (carriage return + line feed) on a real terminal, or plain "\n" otherwise — Windows doesn't translate a bare "\n" and every line staircases right without this.
 func printLine(s string) {
 	if stdoutIsTerm {
 		fmt.Print(s + "\r\n")
@@ -334,9 +328,9 @@ func writeOutput(target, s string , mode int) error {
 		return nil
 	}
 
-	if mode == 1 {
+	if mode == 1 { // truncate
 		return os.WriteFile(target, []byte(s+"\n"), 0644)
-	} else {
+	} else { // append
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 
 		if err != nil {
@@ -364,9 +358,9 @@ func writeError(target string, err error,mode int) error {
 		return nil
 	}
 
-	if mode == 2 {
+	if mode == 2 { // truncate
 		return os.WriteFile(target, []byte(err.Error()+"\n"), 0644)
-	} else {
+	} else { // append
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 
 		if err != nil {
@@ -478,7 +472,7 @@ func handleExecFile(args []string, redirectTarget string, mode int) (string, err
 	if mode == 1 || mode == 2 || mode == 3 || mode == 4 {
 		flags := os.O_WRONLY | os.O_CREATE
 		if mode == 1 || mode == 2 {
-			flags |= os.O_TRUNC
+			flags |= os.O_TRUNC // truncate modes overwrite the file
 		}
 		f, err := os.OpenFile(redirectTarget, flags, 0644)
 		if err != nil {
@@ -486,9 +480,7 @@ func handleExecFile(args []string, redirectTarget string, mode int) (string, err
 		}
 		defer f.Close()
 		if mode == 3 || mode == 4 {
-			// child processes inherit this handle; O_APPEND grants only
-			// FILE_APPEND_DATA on Windows, which most child CRTs can't write
-			// through, so seek to EOF on a normally-opened handle instead.
+			// Windows O_APPEND only grants FILE_APPEND_DATA, which most child processes can't write through, so seek to EOF on a normal handle instead.
 			if _, err := f.Seek(0, io.SeekEnd); err != nil {
 				return "", err
 			}
