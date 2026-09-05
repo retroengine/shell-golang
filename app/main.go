@@ -44,6 +44,7 @@ func handleAutocomplete(partial string) string {
 	return ""
 }
 
+// matchingExecutables scans every directory on PATH for file names starting with partial.
 func matchingExecutables(partial string) []string {
 	if partial == "" {
 		return nil
@@ -74,6 +75,7 @@ func matchingExecutables(partial string) []string {
 	return matches
 }
 
+// handleAutoCompleteExe completes partial to the single matching PATH executable, or does nothing if zero or several match.
 func handleAutoCompleteExe(partial string) (string, error) {
 	matches := matchingExecutables(partial)
 	if len(matches) != 1 {
@@ -98,6 +100,7 @@ func isBareCommandPrefix(input []byte) bool {
 	return !strings.ContainsAny(string(input), " \t'\"\\")
 }
 
+// readLine reads one line a byte at a time, handling Enter, Backspace, and Tab completion itself when stdin is a real terminal.
 func readLine(reader *bufio.Reader) (string, error) {
 	fd := int(os.Stdin.Fd())
 	isTerm := term.IsTerminal(fd)
@@ -207,6 +210,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 	}
 }
 
+// handleInput reads one line and tokenizes it into arguments, resolving single quotes, double quotes, and backslash escapes.
 func handleInput(reader *bufio.Reader) ([]string, error) {
 	line, err := readLine(reader)
 
@@ -217,20 +221,20 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 	line = strings.TrimSpace(line)
 
 	var args []string
-	var current strings.Builder
-	inArg := false
-	inQuote := false
-	inDoubleQuote := false
-	slash := false
-	pendingEscape := false
+	var current strings.Builder // the argument currently being built, one rune at a time
+	inArg := false              // true once current holds a rune, or was opened by an (even empty) quote
+	inQuote := false            // inside '...': every character is literal until the closing '
+	inDoubleQuote := false      // inside "...": literal except for \" and \\
+	slash := false              // previous rune outside quotes was a backslash: keep whatever comes next as-is
+	pendingEscape := false      // previous rune inside double quotes was a backslash: resolve it against this rune
 
 	for _, r := range line {
 		switch {
-		case slash:
+		case slash: // finish an outside-quotes escape: the escaped char is always kept literally
 			current.WriteRune(r)
 			slash = false
 			inArg = true
-		case inQuote:
+		case inQuote: // single-quoted text: only a closing ' has meaning
 			if r == '\'' {
 				inQuote = false
 			} else {
@@ -239,45 +243,45 @@ func handleInput(reader *bufio.Reader) ([]string, error) {
 
 		case inDoubleQuote:
 			switch {
-			case pendingEscape:
+			case pendingEscape: // finish a double-quote escape started by the previous rune
 				pendingEscape = false
 				if r == '"' || r == '\\' {
-					current.WriteRune(r)
+					current.WriteRune(r) // \" and \\ collapse to a single literal character
 				} else {
 					current.WriteRune('\\')
-					current.WriteRune(r)
+					current.WriteRune(r) // any other \x keeps both the backslash and the character
 				}
 			case r == '"':
-				inDoubleQuote = false
+				inDoubleQuote = false // closing double quote
 			case r == '\\':
-				pendingEscape = true
+				pendingEscape = true // defer the decision to the next rune
 			default:
 				current.WriteRune(r)
 			}
 
 		case r == '\'':
-			inQuote = true
+			inQuote = true // opening single quote
 			inArg = true
 		case r == '"':
-			inDoubleQuote = true
+			inDoubleQuote = true // opening double quote
 			inArg = true
 		case r == '\\' && !inQuote && !inDoubleQuote:
-			slash = true
+			slash = true // start an outside-quotes escape
 
 		case r == ' ' || r == '\t':
 			if inArg {
-				args = append(args, current.String())
+				args = append(args, current.String()) // unquoted whitespace ends the current argument
 				current.Reset()
 				inArg = false
 			}
 		default:
-			current.WriteRune(r)
+			current.WriteRune(r) // ordinary character
 			inArg = true
 		}
 	}
 
 	if inArg {
-		args = append(args, current.String())
+		args = append(args, current.String()) // flush the final argument; no trailing whitespace triggers the case above
 	}
 
 	return args, nil
@@ -379,6 +383,7 @@ func writeError(target string, err error,mode int) error {
 
 }
 
+// handleEcho joins everything after the command name with single spaces (args[0] is "echo" itself).
 func handleEcho(args []string) (string, error) {
 	if len(args) == 0 {
 		return "", nil
@@ -389,6 +394,7 @@ func handleEcho(args []string) (string, error) {
 	return cleanStr, nil
 }
 
+// handlePWD returns the current working directory; args is unused since pwd takes no arguments.
 func handlePWD(args []string) (string, error) {
 	dir, err := os.Getwd()
 
@@ -399,13 +405,14 @@ func handlePWD(args []string) (string, error) {
 	return dir, nil
 }
 
+// handleCD changes directory to args[1], resolving "~" to $HOME.
 func handleCD(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("cd: missing operand")
 	}
 
 	if args[1] == "~" {
-		homePath := os.Getenv("HOME")
+		homePath := os.Getenv("HOME") // "~" only, no "~user" or "~/path" expansion
 		err := os.Chdir(homePath)
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("cd: %s: No such home directory", homePath)
@@ -425,12 +432,13 @@ func handleCD(args []string) error {
 	return nil
 }
 
+// handleTYPE classifies args[1] as a shell builtin, an external command resolved via PATH, or not found.
 func handleTYPE(args []string, builtInSet map[string]string) (string, error) {
 	if len(args) == 1 {
 		return "No args provided", nil
 	}
 
-	_, ok := builtInSet[args[1]]
+	_, ok := builtInSet[args[1]] // only the key matters here; builtInSet's values are unused placeholders
 
 	if ok {
 		return fmt.Sprintf("%s is a shell builtin", args[1]), nil
@@ -449,6 +457,7 @@ func handleTYPE(args []string, builtInSet map[string]string) (string, error) {
 	}
 }
 
+// handleExecFile runs an external program resolved from PATH, wiring stdin/stdout/stderr through (or to redirectTarget per mode).
 func handleExecFile(args []string, redirectTarget string, mode int) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("no command provided")
@@ -487,9 +496,9 @@ func handleExecFile(args []string, redirectTarget string, mode int) (string, err
 		}
 
 		if mode == 2 || mode == 4 {
-			cmd.Stderr = f
+			cmd.Stderr = f // stderr modes
 		} else {
-			cmd.Stdout = f
+			cmd.Stdout = f // stdout modes
 		}
 	}
 
@@ -506,7 +515,7 @@ func handleExecFile(args []string, redirectTarget string, mode int) (string, err
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
-	builtInSet := map[string]string{
+	builtInSet := map[string]string{ // keys are the recognised builtins; values are unused, only membership is checked (see handleTYPE)
 		"type": "get cmd type",
 		"echo": "print",
 		"exit": "exiting",
@@ -514,7 +523,7 @@ func main() {
 		"cd":   "change directory",
 	}
 
-	shellLoop:
+	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
 	for {
 		fmt.Print("$ ")
 
@@ -539,11 +548,11 @@ func main() {
 
 		switch args[0] {
 		case "exit":
-			break shellLoop
-		case "echo":
+			break shellLoop // exits the outer "for"; a bare break here would only exit this switch
 
-			cleanStr, _ := handleEcho(args)
-			if mode == 1 || mode == 3 {
+		case "echo":
+			cleanStr, _ := handleEcho(args) // handleEcho never errors
+			if mode == 1 || mode == 3 {     // stdout redirect requested (truncate or append)
 				writeOutput(redirectTarget, cleanStr,mode)
 			} else {
 				printLine(cleanStr)
@@ -553,7 +562,7 @@ func main() {
 			dirName, err := handlePWD(args)
 
 			if err != nil {
-				if mode == 2 || mode == 4{
+				if mode == 2 || mode == 4{ // stderr redirect requested
 					writeError(redirectTarget, err,mode)
 				} else {
 					printLine(fmt.Sprintf("Error printing the working directory %s", err))
@@ -561,14 +570,14 @@ func main() {
 				break
 			}
 
-			if mode == 1 || mode == 3{
+			if mode == 1 || mode == 3{ // stdout redirect requested
 				writeOutput(redirectTarget, dirName, mode)
 			} else {
 				printLine(dirName)
 			}
 
 		case "cd":
-			errCD := handleCD(args)
+			errCD := handleCD(args) // cd has no stdout, so it isn't subject to output redirection
 
 			if errCD != nil {
 				printLine(errCD.Error())
@@ -577,20 +586,20 @@ func main() {
 		case "type":
 			typeString, err := handleTYPE(args, builtInSet)
 			if err != nil {
-				if mode == 2 || mode == 4{
+				if mode == 2 || mode == 4{ // stderr redirect requested
 					writeError(redirectTarget, err,mode)
 				} else {
 					printLine(err.Error())
 				}
 				break
 			}
-			if mode == 1 || mode == 3 {
+			if mode == 1 || mode == 3 { // stdout redirect requested
 				writeOutput(redirectTarget, typeString,mode)
 			} else {
 				printLine(typeString)
 			}
 
-		default:
+		default: // not a builtin: resolve and run as an external program
 			msg, err := handleExecFile(args, redirectTarget, mode)
 
 			if msg != "" || err != nil {
