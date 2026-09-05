@@ -51,6 +51,10 @@ func FuzzHandleEcho(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, word string) {
 		// Exercised the way main calls it: the command name plus one argument.
+		// Quote stripping happens upstream in handleInput's parser; by the
+		// time an arg reaches handleEcho, any quote characters left in it are
+		// literal content (e.g. from echo "it's"), so handleEcho must join
+		// args verbatim rather than interpreting them.
 		got, err := handleEcho([]string{"echo", word})
 
 		call := cmdLine([]string{"echo", word})
@@ -59,9 +63,9 @@ func FuzzHandleEcho(f *testing.F) {
 			t.Fatal(failLine(call, "no error", show(err.Error()),
 				"handleEcho must return a nil error for every input"))
 		}
-		if strings.Contains(got, "'") {
-			t.Fatal(failLine(call, "no single quotes left in the result", show(got),
-				"handleEcho strips every ' character"))
+		if got != word {
+			t.Fatal(failLine(call, show(word), show(got),
+				"handleEcho joins already-parsed args verbatim; it does not interpret quotes"))
 		}
 	})
 }

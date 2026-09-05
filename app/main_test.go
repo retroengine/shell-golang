@@ -1673,6 +1673,303 @@ func TestHandleAutocomplete_NeverErrors(t *testing.T) {
 }
 
 // ============================================================
+// handleAutoCompleteExe — tab completion for external executables on PATH
+// ============================================================
+
+func TestHandleAutoCompleteExe_Valid(t *testing.T) {
+	tests := []struct {
+		name    string
+		files   []string // plain files created in the PATH dir before the call
+		partial string
+		want    string
+		why     string
+	}{
+		{
+			name:    "custom completes to custom_executable with a trailing space",
+			files:   []string{"custom_executable"},
+			partial: "custom",
+			want:    "custom_executable ",
+			why:     "spec: typing the start of an executable's name and pressing <TAB> completes it to the full executable name, with a trailing space",
+		},
+		{
+			name:    "skips a non-matching file that sorts first to find the real match",
+			files:   []string{"aaa_other_tool", "custom_executable"},
+			partial: "custom",
+			want:    "custom_executable ",
+			why:     "spec: completion must match the prefix that was typed, not just return whatever PATH lists first",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, f), []byte(""), 0644); err != nil {
+					t.Fatalf("setup: cannot create %q: %v", f, err)
+				}
+			}
+			t.Setenv("PATH", dir)
+
+			call := typed(tt.partial)
+			got, err := handleAutoCompleteExe(tt.partial)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleAutoCompleteExe_Edge(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T) // sets PATH for the case
+		partial string
+		want    string
+		why     string
+	}{
+		{
+			name: "empty partial does not complete",
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				mustWrite(t, dir, "custom_executable")
+				t.Setenv("PATH", dir)
+			},
+			partial: "",
+			want:    "",
+			why:     "spec gives no rule for completing on nothing typed, so an empty prefix should not silently pick an executable",
+		},
+		{
+			name: "no executable on PATH matches the prefix",
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				mustWrite(t, dir, "custom_executable")
+				t.Setenv("PATH", dir)
+			},
+			partial: "xyz",
+			want:    "",
+			why:     "spec: a prefix with no matching executable has no completion",
+		},
+		{
+			name: "a same-named directory on PATH is not offered as a completion",
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.Mkdir(filepath.Join(dir, "custom_dir"), 0755); err != nil {
+					t.Fatalf("setup: cannot create dir: %v", err)
+				}
+				t.Setenv("PATH", dir)
+			},
+			partial: "custom",
+			want:    "",
+			why:     "only executable files should be completed — a directory on PATH is not itself runnable",
+		},
+		{
+			name: "a nonexistent PATH directory is skipped, not fatal, and search continues",
+			setup: func(t *testing.T) {
+				missing := filepath.Join(t.TempDir(), "does-not-exist")
+				real := t.TempDir()
+				mustWrite(t, real, "custom_executable")
+				t.Setenv("PATH", missing+string(os.PathListSeparator)+real)
+			},
+			partial: "custom",
+			want:    "custom_executable ",
+			why:     "notes: PATH can include directories that don't exist on disk, so lookups must skip them gracefully instead of failing",
+		},
+		{
+			name: "empty PATH has no directories to search",
+			setup: func(t *testing.T) {
+				t.Setenv("PATH", "")
+			},
+			partial: "custom",
+			want:    "",
+			why:     "an empty PATH means there is nowhere to look, not an error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setup(t)
+
+			call := typed(tt.partial)
+			got, err := handleAutoCompleteExe(tt.partial)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleAutoCompleteExe_NeverErrors(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	real := t.TempDir()
+	mustWrite(t, real, "custom_executable")
+	t.Setenv("PATH", missing+string(os.PathListSeparator)+real)
+
+	tests := []struct {
+		name    string
+		partial string
+	}{
+		{name: "empty string", partial: ""},
+		{name: "whitespace", partial: "   "},
+		{name: "unbalanced quote", partial: "'"},
+		{name: "unicode", partial: "éx"},
+		{name: "prefix longer than any real filename", partial: "this_prefix_is_too_long_to_match_anything"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := typed(tt.partial)
+			_, err := handleAutoCompleteExe(tt.partial)
+			mustNoErr(t, call, err, "handleAutoCompleteExe must return a nil error for every input")
+		})
+	}
+}
+
+// ============================================================
+// matchingExecutables — the shared PATH-scan behind both the single-match
+// completion (handleAutoCompleteExe) and the double-<TAB> match listing
+// ============================================================
+
+func TestMatchingExecutables_Valid(t *testing.T) {
+	tests := []struct {
+		name    string
+		files   []string // plain files created in the PATH dir before the call
+		partial string
+		want    []string
+		why     string
+	}{
+		{
+			name:    "a single match is returned as a one-item list",
+			files:   []string{"custom_executable"},
+			partial: "custom",
+			want:    []string{"custom_executable"},
+			why:     "spec: exactly one match is what handleAutoCompleteExe completes to immediately",
+		},
+		{
+			name:    "multiple matches are returned sorted alphabetically, not in the order PATH lists them",
+			files:   []string{"xyz_quz", "xyz_bar", "xyz_baz"},
+			partial: "xyz_",
+			want:    []string{"xyz_bar", "xyz_baz", "xyz_quz"},
+			why:     "spec: the second <TAB> press must list all matching executables in alphabetical order",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tt.files {
+				mustWrite(t, dir, f)
+			}
+			t.Setenv("PATH", dir)
+
+			call := typed(tt.partial)
+			got := matchingExecutables(tt.partial)
+
+			wantArgs(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestMatchingExecutables_Edge(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T) // sets PATH for the case
+		partial string
+		want    []string
+		why     string
+	}{
+		{
+			name: "empty partial has no matches",
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				mustWrite(t, dir, "custom_executable")
+				t.Setenv("PATH", dir)
+			},
+			partial: "",
+			want:    []string{},
+			why:     "spec gives no rule for completing on nothing typed, so an empty prefix should not silently match everything",
+		},
+		{
+			name: "no executable on PATH matches the prefix",
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				mustWrite(t, dir, "custom_executable")
+				t.Setenv("PATH", dir)
+			},
+			partial: "xyz",
+			want:    []string{},
+			why:     "spec: a prefix with no matching executable has no completions to offer or list",
+		},
+		{
+			name: "a same-named directory on PATH is not offered as a completion",
+			setup: func(t *testing.T) {
+				dir := t.TempDir()
+				mustWrite(t, dir, "xyz_file")
+				if err := os.Mkdir(filepath.Join(dir, "xyz_dir"), 0755); err != nil {
+					t.Fatalf("setup: cannot create dir: %v", err)
+				}
+				t.Setenv("PATH", dir)
+			},
+			partial: "xyz_",
+			want:    []string{"xyz_file"},
+			why:     "only executable files should ever be listed — a directory on PATH is not itself runnable",
+		},
+		{
+			name: "an executable listed under two PATH directories is only reported once",
+			setup: func(t *testing.T) {
+				dirA, dirB := t.TempDir(), t.TempDir()
+				mustWrite(t, dirA, "dup_tool")
+				mustWrite(t, dirB, "dup_tool")
+				t.Setenv("PATH", dirA+string(os.PathListSeparator)+dirB)
+			},
+			partial: "dup_",
+			want:    []string{"dup_tool"},
+			why:     "notes: the same executable name can appear in more than one PATH directory; it must not be listed twice",
+		},
+		{
+			name: "a nonexistent PATH directory is skipped, not fatal, and search continues",
+			setup: func(t *testing.T) {
+				missing := filepath.Join(t.TempDir(), "does-not-exist")
+				real := t.TempDir()
+				mustWrite(t, real, "custom_executable")
+				t.Setenv("PATH", missing+string(os.PathListSeparator)+real)
+			},
+			partial: "custom",
+			want:    []string{"custom_executable"},
+			why:     "notes: PATH can include directories that don't exist on disk, so lookups must skip them gracefully instead of failing",
+		},
+		{
+			name: "empty PATH has no directories to search",
+			setup: func(t *testing.T) {
+				t.Setenv("PATH", "")
+			},
+			partial: "custom",
+			want:    []string{},
+			why:     "an empty PATH means there is nowhere to look, not an error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setup(t)
+
+			call := typed(tt.partial)
+			got := matchingExecutables(tt.partial)
+
+			wantArgs(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+// mustWrite creates an empty plain file named name inside dir, failing the
+// test immediately (setup, not an assertion about the feature) if it can't.
+func mustWrite(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(""), 0644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", name, err)
+	}
+}
+
+// ============================================================
 // helpers
 //
 // The assertion helpers these feed live in report_test.go.

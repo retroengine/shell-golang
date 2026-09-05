@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vanaparthi Saikiran</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anton&family=UnifrakturCook&family=Oswald:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+  :root{
+    --ink:#0d0d0d;
+    --paper:#ede1bb;
+    --grove:#2e7d32;
+    --grove-bright:#8fd14f;
+    --gold:#f2c230;
+    --blood:#c41e3a;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; }
+  body{
+    margin:0;
+    min-height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:
+      radial-gradient(ellipse at 50% 28%, #1a2414 0%, var(--ink) 58%, #050505 100%);
+    font-family:'Oswald', "Arial Narrow", sans-serif;
+    padding:3rem 1.25rem;
+    position:relative;
+    overflow:hidden;
+  }
+  body::before{
+    content:"";
+    position:fixed; inset:0;
+    background:repeating-linear-gradient(
+      to bottom,
+      rgba(255,255,255,.035) 0px,
+      rgba(255,255,255,.035) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+    pointer-events:none;
+    mix-blend-mode:overlay;
+  }
+
+  .plate{
+    position:relative;
+    width:min(680px, 100%);
+    padding:clamp(2.25rem,7vw,3.75rem) clamp(1.5rem,6vw,3.25rem);
+    border:1px solid rgba(242,194,48,.35);
+    background:linear-gradient(180deg, rgba(46,125,50,.06), rgba(0,0,0,0) 40%);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    text-align:center;
+    gap:.4rem;
+    animation:reveal .9s cubic-bezier(.2,.8,.2,1) both;
+  }
+  @media (prefers-reduced-motion:reduce){
+    .plate{ animation:none; }
+  }
+  @keyframes reveal{
+    0%{ opacity:0; transform:scale(.94); }
+    55%{ opacity:1; }
+    100%{ opacity:1; transform:scale(1); }
+  }
+
+  .corner{ position:absolute; width:22px; height:22px; border:2px solid var(--gold); opacity:.7; }
+  .corner.tl{ top:-1px; left:-1px; border-right:none; border-bottom:none; }
+  .corner.tr{ top:-1px; right:-1px; border-left:none; border-bottom:none; }
+  .corner.bl{ bottom:-1px; left:-1px; border-right:none; border-top:none; }
+  .corner.br{ bottom:-1px; right:-1px; border-left:none; border-top:none; }
+
+  .radar{ position:absolute; top:16px; right:16px; width:34px; height:34px; opacity:.55; }
+
+  .eyebrow{
+    font-size:.72rem;
+    letter-spacing:.4em;
+    color:var(--grove-bright);
+    text-transform:uppercase;
+    opacity:.85;
+    margin:0 0 .5rem;
+  }
+
+  .block-title{
+    font-family:'Anton', "Arial Narrow", sans-serif;
+    font-size:clamp(2.5rem, 9.5vw, 4.7rem);
+    line-height:.95;
+    letter-spacing:.01em;
+    color:var(--paper);
+    text-transform:uppercase;
+    text-wrap:balance;
+    transform:skewX(-6deg);
+    -webkit-text-stroke:3px var(--ink);
+    text-shadow:
+      2px 0 var(--ink), -2px 0 var(--ink),
+      0 2px var(--ink), 0 -2px var(--ink),
+      2px 2px var(--ink), -2px -2px var(--ink),
+      2px -2px var(--ink), -2px 2px var(--ink),
+      0 0 24px rgba(143,209,79,.4);
+    margin:0;
+  }
+
+  .script-title{
+    font-family:'UnifrakturCook', "Segoe Script", cursive;
+    font-weight:700;
+    font-size:clamp(2.7rem, 10.5vw, 5.3rem);
+    line-height:1;
+    color:var(--gold);
+    text-wrap:balance;
+    -webkit-text-stroke:1.5px var(--ink);
+    text-shadow:1px 1px var(--ink), -1px -1px var(--ink), 0 0 18px rgba(0,0,0,.55);
+    transform:rotate(-2deg);
+    margin:-.18em 0 0;
+  }
+
+  .rule{
+    width:min(320px,70%);
+    height:1px;
+    margin:1rem 0 .65rem;
+    background:linear-gradient(to right, transparent, var(--gold), transparent);
+    position:relative;
+  }
+  .rule::after{
+    content:"";
+    position:absolute; left:50%; top:50%;
+    width:7px; height:7px;
+    background:var(--gold);
+    transform:translate(-50%,-50%) rotate(45deg);
+  }
+
+  .tagline{
+    font-size:clamp(.72rem,1.7vw,.88rem);
+    letter-spacing:.26em;
+    text-transform:uppercase;
+    color:var(--grove-bright);
+    opacity:.9;
+    margin:0;
+  }
+
+  .stamp{
+    position:absolute;
+    bottom:12px; left:18px;
+    font-family:'Oswald', sans-serif;
+    font-style:italic;
+    font-size:.65rem;
+    letter-spacing:.12em;
+    color:var(--paper);
+    opacity:.4;
+  }
+</style>
+</head>
+<body>
+<div class="plate">
+  <span class="corner tl"></span>
+  <span class="corner tr"></span>
+  <span class="corner bl"></span>
+  <span class="corner br"></span>
+
+  <svg class="radar" viewBox="0 0 34 34" fill="none" aria-hidden="true">
+    <circle cx="17" cy="17" r="15" stroke="#f2c230" stroke-width="1"/>
+    <circle cx="17" cy="17" r="9" stroke="#f2c230" stroke-width="1" opacity=".6"/>
+    <circle cx="17" cy="17" r="2" fill="#f2c230"/>
+  </svg>
+
+  <p class="eyebrow">State of San Andreas</p>
+  <h1 class="block-title">Vanaparthi</h1>
+  <h2 class="script-title">Saikiran</h2>
+
+  <div class="rule"></div>
+  <p class="tagline">Los&nbsp;Santos&nbsp;·&nbsp;San&nbsp;Fierro&nbsp;·&nbsp;Las&nbsp;Venturas</p>
+
+  <span class="stamp">// portfolio build 2026</span>
+</div>
+</body>
+</html>

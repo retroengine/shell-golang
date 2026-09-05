@@ -1081,6 +1081,120 @@ func TestE2E_TabAutocomplete_NoMatch(t *testing.T) {
 }
 
 // ============================================================
+// tab completion — external executables
+// ============================================================
+
+func TestE2E_TabAutocomplete_Executable(t *testing.T) {
+	catPath, err := exec.LookPath("cat")
+	if err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	// Windows will only resolve an extensionless name on PATH via PATHEXT
+	// if the file on disk actually carries one of those extensions, so the
+	// copy needs a real .exe suffix even though the completion (and the
+	// session below) never mentions one.
+	exePath := dir + "/custom_executable"
+	if runtime.GOOS == "windows" {
+		exePath += ".exe"
+	}
+	data, err := os.ReadFile(catPath)
+	if err != nil {
+		t.Fatalf("setup: cannot read cat binary: %v", err)
+	}
+	if err := os.WriteFile(exePath, data, 0o755); err != nil {
+		t.Fatalf("setup: cannot write %q: %v", exePath, err)
+	}
+
+	file := dir + "/file.txt"
+	if err := os.WriteFile(file, []byte("content"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	tests := []struct {
+		name string
+		path string // value PATH is set to before the session runs
+		why  string
+	}{
+		{
+			name: "custom<TAB> completes to custom_executable and runs it",
+			path: dir,
+			why:  "spec: custom<TAB> completes to custom_executable (with a trailing space), so the file argument that follows is passed to it and printed",
+		},
+		{
+			name: "completion still works when PATH also lists a directory that doesn't exist",
+			path: filepath.ToSlash(filepath.Join(t.TempDir(), "does-not-exist")) + string(os.PathListSeparator) + dir,
+			why:  "notes: PATH can include directories that don't exist on disk, so completion must handle that gracefully rather than failing the whole lookup",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Prepend the test directories to the real PATH rather than
+			// replacing it: the copied cat binary is an MSYS/Git-Bash build
+			// on Windows and needs its runtime DLL, which lives in a
+			// directory the real PATH already provides.
+			t.Setenv("PATH", tt.path+string(os.PathListSeparator)+os.Getenv("PATH"))
+			session := fmt.Sprintf("custom\t'%s'\n", file)
+			got := runShell(t, binary, session)
+			assertContainsWhy(t, session, got, "content", tt.why)
+		})
+	}
+}
+
+// ============================================================
+// tab completion — multiple matches (double <TAB>)
+// ============================================================
+
+func TestE2E_TabAutocomplete_MultipleMatches(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	for _, name := range []string{"xyz_quz", "xyz_bar", "xyz_baz"} {
+		if err := os.WriteFile(dir+"/"+name, []byte(""), 0o755); err != nil {
+			t.Fatalf("setup: cannot create %q: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", dir)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "first <TAB> on an ambiguous prefix only rings the bell",
+			session: "xyz_\t\n",
+			want:    "\x07",
+			why:     "spec: on the first <TAB> press, ring the bell",
+		},
+		{
+			name:    "second <TAB> lists every match, alphabetically sorted and space-separated",
+			session: "xyz_\t\t\n",
+			want:    "xyz_bar  xyz_baz  xyz_quz",
+			why:     "spec: on the second <TAB> press, print all matching executables on a new line, listed in alphabetical order, separated by at least one space",
+		},
+		{
+			name:    "the prompt reappears on the next line with the original prefix preserved",
+			session: "xyz_\t\t\n",
+			want:    "$ xyz_",
+			why:     "spec: show the prompt again on the next line, keeping the original command prefix",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
 // helpers
 // ============================================================
 
