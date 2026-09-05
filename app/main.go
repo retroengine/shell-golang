@@ -82,6 +82,18 @@ func handleAutoCompleteExe(partial string) (string, error) {
 	return matches[0] + " ", nil
 }
 
+// longestCommonPrefix returns the longest prefix shared by every string in
+// strs. strs must be non-empty.
+func longestCommonPrefix(strs []string) string {
+	prefix := strs[0]
+	for _, s := range strs[1:] {
+		for !strings.HasPrefix(s, prefix) {
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	return prefix
+}
+
 func isBareCommandPrefix(input []byte) bool {
 	return !strings.ContainsAny(string(input), " \t'\"\\")
 }
@@ -163,6 +175,14 @@ func readLine(reader *bufio.Reader) (string, error) {
 				input = []byte(matches[0] + " ")
 				consecutiveTabs = 0
 			default: // 2+ matches
+				if lcp := longestCommonPrefix(matches); len(lcp) > len(input) {
+					// Matches share more prefix than what's typed so far: complete
+					// as far as that shared prefix, no bell/list/cycle needed yet.
+					input = []byte(lcp)
+					consecutiveTabs = 0
+					break
+				}
+
 				if consecutiveTabs < 2 {
 					fmt.Print("\x07") // first tab on an ambiguous prefix: bell only, leave input unchanged
 					break
