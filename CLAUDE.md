@@ -13,7 +13,11 @@ This file tells you how to generate tests whenever a new task is completed.
 
 ```
 app/
-  main.go          ← the shell implementation (builtins + main loop)
+  main.go          ← entry point: the main loop + command dispatch
+  parser.go        ← handleInput (tokenizer)
+  builtins.go      ← builtin handlers (echo, pwd, cd, type, exec)
+  redirect.go      ← redirect parsing + output/error writers
+  autocomplete.go  ← Tab completion + readLine
   main_test.go     ← unit tests  (one test block per handler function)
   e2e_test.go      ← end-to-end tests (compile binary, pipe stdin, check stdout)
   report_test.go   ← the shared reporter + every assertion helper (do not modify)
