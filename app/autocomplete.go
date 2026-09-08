@@ -150,11 +150,9 @@ func readLine(reader *bufio.Reader) (string, error) {
 
 			consecutiveTabs++
 
-			// Split input into the already-finished part (prefix, carried through untouched) and
-			// the word actually being completed (word): no space means the whole buffer is the
-			// first word (the command itself); a space means word is whatever follows the last one.
+			
 			prefix := ""
-			word := string(input)
+			word := string(input) // assume no space
 			if idx := strings.LastIndex(string(input), " "); idx != -1 {
 				prefix = string(input[:idx+1])
 				word = string(input[idx+1:])
@@ -170,22 +168,23 @@ func readLine(reader *bufio.Reader) (string, error) {
 				}
 
 				matches := matchingExecutables(word)
+
 				switch len(matches) {
 				case 0:
 					fmt.Print("\x07") // \x07 is the ASCII BEL char, beeps the terminal; no match, input unchanged
 					consecutiveTabs = 0
 				case 1:
-					input = []byte(matches[0] + " ")
+					input = []byte(matches[0] + " ") //only one file then print at end exit
 					consecutiveTabs = 0
 				default: // 2+ matches
 					if lcp := longestCommonPrefix(matches); len(lcp) > len(word) {
-						input = []byte(lcp) // matches share a longer prefix than what's typed: complete up to it, no bell/list yet
+						input = []byte(lcp) // multiple then go for longest prefix file 
 						consecutiveTabs = 0
 						break
 					}
 
 					if consecutiveTabs < 2 {
-						fmt.Print("\x07") // \x07 (BEL): first tab on an ambiguous prefix just beeps, input unchanged
+						fmt.Print("\x07") //if no lcp found
 						break
 					}
 
@@ -200,7 +199,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 					cycleIndex = -1 // the next Tab press lands on index 0
 					continue        // prompt already redrawn above; skip the redraw below
 				}
-				break
+				break // to break out of bigger switch 
 			}
 
 			// Later argument: complete against entries in the current working directory.

@@ -15,6 +15,7 @@ func main() {
 		"exit": "exiting",
 		"pwd":  "get working directory",
 		"cd":   "change directory",
+		"complete ": "registers autocompletion for given word",
 	}
 
 	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
