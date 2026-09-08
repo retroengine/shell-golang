@@ -87,15 +87,6 @@ func matchingCWDEntries(partial string) []os.DirEntry {
 	return matches
 }
 
-// handleAutoCompleteExe completes partial to the single matching PATH executable, or does nothing if zero or several match.
-func handleAutoCompleteExe(partial string) (string, error) {
-	matches := matchingExecutables(partial)
-	if len(matches) != 1 {
-		return "", nil
-	}
-	return matches[0] + " ", nil
-}
-
 // longestCommonPrefix returns the longest prefix shared by every string in strs (strs must be non-empty).
 func longestCommonPrefix(strs []string) string {
 	prefix := strs[0]
