@@ -138,3 +138,33 @@ func handleExecFile(args []string, redirectTarget string, mode int) (string, err
 	return "", nil
 
 }
+
+var completeSet = map[string]string{}
+
+func handleComplete(args []string) string {
+	if len(args) < 2 {
+		return "In-Valid number of arguments"
+	}
+	switch args[1] {
+	case "-C":
+		if len(args) < 4 {
+			return "In-Valid number of arguments"
+		}
+		completeSet[args[3]] = args[2]
+		return ""
+	case "-p":
+		if len(args) < 3 {
+			return "In-Valid number of arguments"
+		}
+		val, ok := completeSet[args[2]]
+
+		if !ok {
+			return fmt.Sprintf("complete: %s: no completion specification", args[2])
+		} else {
+			return fmt.Sprintf("complete -C '%s' %s", val, args[2])
+		}
+
+	default:
+		return fmt.Sprintf("complete: %s: no completion specification", args[1])
+	}
+}

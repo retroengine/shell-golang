@@ -81,7 +81,7 @@ func main() {
 		case "type":
 			typeString, err := handleTYPE(args, builtInSet)
 			if err != nil {
-				if mode == 2 || mode == 4{ // stderr redirect requested
+				if mode == 2 || mode == 4 { // stderr redirect requested
 					writeError(redirectTarget, err,mode)
 				} else {
 					printLine(err.Error())
@@ -94,6 +94,14 @@ func main() {
 				printLine(typeString)
 			}
 
+		case "complete":
+			strComplete := handleComplete(args)
+
+			if strComplete != "" {
+				printLine(strComplete)
+			}
+		
+		
 		default: // not a builtin: resolve and run as an external program
 			msg, err := handleExecFile(args, redirectTarget, mode)
 

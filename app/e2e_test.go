@@ -1195,6 +1195,423 @@ func TestE2E_TabAutocomplete_MultipleMatches(t *testing.T) {
 }
 
 // ============================================================
+// complete -p
+// ============================================================
+
+func TestE2E_CompleteDashP(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "complete -p git reports no completion specification",
+			session: "complete -p git\n",
+			want:    "complete: git: no completion specification",
+			why:     "spec: complete -p <command> prints 'complete: <command>: no completion specification' when nothing has been registered",
+		},
+		{
+			name:    "the command name passed to -p is reflected in the message",
+			session: "complete -p docker\n",
+			want:    "complete: docker: no completion specification",
+			why:     "spec: the command name in the output matches the one passed to -p",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// complete -C (register) and -p (display registered completions)
+// ============================================================
+
+func TestE2E_CompleteRegisterAndDisplay(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "registering with -C then querying with -p prints the normalized format",
+			session: "complete -C /path/to/git/completer git\ncomplete -p git\n",
+			want:    "complete -C '/path/to/git/completer' git",
+			why:     "spec: complete -C /path/to/git/completer git then complete -p git prints complete -C '/path/to/git/completer' git",
+		},
+		{
+			name:    "a different registered command prints its own path",
+			session: "complete -C /path/to/docker/completer docker\ncomplete -p docker\n",
+			want:    "complete -C '/path/to/docker/completer' docker",
+			why:     "spec: complete -C /path/to/docker/completer docker then complete -p docker prints complete -C '/path/to/docker/completer' docker",
+		},
+		{
+			name:    "extra whitespace in the -C invocation still produces single-spaced output",
+			session: "complete   -C    /path/to/git/completer   git\ncomplete -p git\n",
+			want:    "complete -C '/path/to/git/completer' git",
+			why:     "spec: arguments are separated by exactly one space in the output, regardless of how the registration command was written",
+		},
+		{
+			name:    "an unregistered command still gives the earlier stage's error",
+			session: "complete -p nosuchcmd\n",
+			want:    "complete: nosuchcmd: no completion specification",
+			why:     "spec: that error is still the correct response when no completion has been registered for the given command",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestE2E_CompleteDashC_NoOutput(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	session := "complete -C /path/to/git/completer git\nexit\n"
+	got := runShell(t, binary, session)
+
+	if strings.Contains(got, "complete") {
+		t.Error(failLine(typedSession(session), "no output containing \"complete\"", got,
+			"spec: complete -C <path> <command> registers the completion and produces no output"))
+	} else {
+		t.Logf("%s %s\n    expected: no output containing \"complete\"\n    received: %s", markPass, typedSession(session), show(got))
+	}
+}
+
+
+// buildCompleterScript compiles a tiny standalone program that sleeps for
+// delay (if non-zero) and then prints output as its single line of stdout,
+// standing in for the external completer scripts registered via
+// `complete -C`. Returns its path, slash-normalised for embedding in a
+// session string.
+func buildCompleterScript(t *testing.T, output string, delay time.Duration) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := fmt.Sprintf(`package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	time.Sleep(%d * time.Millisecond)
+	fmt.Println(%q)
+}
+`, delay.Milliseconds(), output)
+
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write completer source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "completer")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build completer script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// running the completer script
+// ============================================================
+
+func TestE2E_CompleterScript(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name            string
+		command         string // the command a completer is registered for
+		completerOutput string // the single line the completer script prints
+		typedAfterTab   string // extra text typed right after the <TAB> completes
+		want            string
+		why             string
+	}{
+		{
+			name:            "the completer's single line completes the word, followed by a trailing space",
+			command:         "echo",
+			completerOutput: "saikiran",
+			typedAfterTab:   "",
+			want:            "saikiran",
+			why:             "spec: your shell should run the registered completer script, read its stdout, and use that single line to complete the user's input, followed by a trailing space",
+		},
+		{
+			name:            "text typed after the completion starts a new argument",
+			command:         "echo",
+			completerOutput: "foo",
+			typedAfterTab:   "bar",
+			want:            "foo bar",
+			why:             "spec: the completed line is followed by a trailing space, so text typed next (bar) becomes a separate argument rather than continuing the completed word (foo)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			completerPath := buildCompleterScript(t, tt.completerOutput, 0)
+
+			session := fmt.Sprintf("complete -C '%s' %s\n%s \t%s\n",
+				completerPath, tt.command, tt.command, tt.typedAfterTab)
+
+			got := runShell(t, binary, session)
+			assertContainsWhy(t, session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// running the completer script — waits for it to finish
+// ============================================================
+
+func TestE2E_CompleterScript_WaitsForSlowScript(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	completerPath := buildCompleterScript(t, "delayed_output", 300*time.Millisecond)
+
+	session := fmt.Sprintf("complete -C '%s' echo\necho \t\n", completerPath)
+	want := "delayed_output"
+	why := "notes: the shell must wait for the completer script to finish before inserting the completion, otherwise it may read partial output"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+// ============================================================
+// running the completer script — scoped to the registered command
+// ============================================================
+
+func TestE2E_CompleterScript_ScopedToRegisteredCommand(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	completerPath := buildCompleterScript(t, "alpha_candidate", 0)
+
+	// alpha has a completer registered; beta does not, so its <TAB> must not
+	// pick up alpha's script output.
+	session := fmt.Sprintf("complete -C '%s' alpha\nbeta \t\n", completerPath)
+	got := runShell(t, binary, session)
+
+	if strings.Contains(got, "alpha_candidate") {
+		t.Error(failLine(typedSession(session), "no completion from alpha's script", got,
+			"spec: your shell should first check whether a completer is registered for that command; a completer registered for a different command must not be used"))
+	} else {
+		t.Logf("%s %s\n    expected: no completion from alpha's script\n    received: %s", markPass, typedSession(session), show(got))
+	}
+}
+
+// buildEmptyCompleterScript compiles a completer program that exits
+// successfully without writing anything to stdout — the true "no
+// candidates" case, distinct from buildCompleterScript(t, "", 0), which
+// would still print a bare newline.
+func buildEmptyCompleterScript(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("setup: cannot write completer source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "completer")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build completer script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// running the completer script — empty output
+// ============================================================
+
+func TestE2E_CompleterScript_EmptyOutput(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	completerPath := buildEmptyCompleterScript(t)
+
+	session := fmt.Sprintf("complete -C '%s' echo\necho xyz\t\n", completerPath)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "\x07",
+		"spec: when the completer script prints nothing, the shell rings the terminal bell")
+	assertContainsWhy(t, session, got, "xyz",
+		"spec: the input line is left unchanged, so echo still runs with its originally typed argument")
+}
+
+// buildArgEchoCompleterScript compiles a completer program that echoes back
+// exactly what it received as its own arguments, joined by "|" — so a test
+// can assert on the literal argv[1..3] values the shell passed, independent
+// of any candidate-filtering logic (which is the completer script's own job
+// per spec, not something the shell needs to get right).
+func buildArgEchoCompleterScript(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
+func main() {
+	fmt.Println(strings.Join(os.Args[1:], "|"))
+}
+`
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write completer source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "completer")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build completer script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// running the completer script — passing argv[1..3]
+// ============================================================
+
+func TestE2E_CompleterScript_PassesArguments(t *testing.T) {
+	binary := buildTestBinary(t)
+	completerPath := buildArgEchoCompleterScript(t)
+
+	tests := []struct {
+		name  string
+		typed string // what's typed, right up to <TAB>, after "complete -C ... echo\n"
+		want  string // the argv[1]|argv[2]|argv[3] the completer should have received
+		why   string
+	}{
+		{
+			name:  "command, partial word, and the word before it",
+			typed: "echo remote set",
+			want:  "echo|set|remote",
+			why:   "spec: for `git remote set<TAB>`, the shell passes argv[1]=git (command), argv[2]=set (the word being completed), argv[3]=remote (the word before it)",
+		},
+		{
+			name:  "partial word with no preceding word",
+			typed: "echo s",
+			want:  "echo|s|",
+			why:   "spec: argv[3] is an empty string when there's no word before the one being completed",
+		},
+		{
+			name:  "no partial text at all, right after the command",
+			typed: "echo ",
+			want:  "echo||",
+			why:   "notes: e.g. git <TAB> — pass an empty string as argv[3]; here argv[2] is empty too, since nothing has been typed yet",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := fmt.Sprintf("complete -C '%s' echo\n%s\t\n", completerPath, tt.typed)
+			got := runShell(t, binary, session)
+			assertContainsWhy(t, session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// buildEnvEchoCompleterScript compiles a completer program that echoes back
+// the COMP_LINE and COMP_POINT environment variables it received, joined by
+// "|" — so a test can assert on the literal values the shell set.
+func buildEnvEchoCompleterScript(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Println(os.Getenv("COMP_LINE") + "|" + os.Getenv("COMP_POINT"))
+}
+`
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write completer source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "completer")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build completer script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// running the completer script — COMP_LINE / COMP_POINT
+// ============================================================
+
+func TestE2E_CompleterScript_PassesCompEnv(t *testing.T) {
+	binary := buildTestBinary(t)
+	completerPath := buildEnvEchoCompleterScript(t)
+
+	tests := []struct {
+		name  string
+		typed string // what's typed, right up to <TAB>, after "complete -C ... echo\n"
+		want  string // the COMP_LINE|COMP_POINT the completer should have received
+		why   string
+	}{
+		{
+			name:  "COMP_LINE is the full typed line, COMP_POINT its byte length",
+			typed: "echo ad",
+			want:  "echo ad|7",
+			why:   `spec: for "git ad<TAB>" the shell sets COMP_LINE="git ad" and COMP_POINT=6 (its byte length); "echo ad" is 7 bytes for the same reason, just a longer command name`,
+		},
+		{
+			name:  "COMP_POINT is a byte index, not a character index",
+			typed: "echo é",
+			want:  "echo é|7",
+			why:   `notes: COMP_POINT is a byte index — "echo é" is 7 bytes ("echo " is 5 ASCII bytes plus 2 bytes for the multibyte é), not 6, which is what counting runes/characters would give`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := fmt.Sprintf("complete -C '%s' echo\n%s\t\n", completerPath, tt.typed)
+			got := runShell(t, binary, session)
+			assertContainsWhy(t, session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
 // helpers
 // ============================================================
 

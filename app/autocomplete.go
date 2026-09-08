@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -87,6 +88,22 @@ func matchingCWDEntries(partial string) []os.DirEntry {
 	return matches
 }
 
+
+func runCompleter(script string, args []string, compLine string, compPoint int) (string, error) {
+	cmd := exec.Command(script, args...)
+	cmd.Env = append(os.Environ(),
+		"COMP_LINE="+compLine,
+		fmt.Sprintf("COMP_POINT=%d", compPoint),
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	line := strings.SplitN(string(out), "\n", 2)[0]
+	return strings.TrimRight(line, "\r"), nil
+}
+
 // longestCommonPrefix returns the longest prefix shared by every string in strs (strs must be non-empty).
 func longestCommonPrefix(strs []string) string {
 	prefix := strs[0]
@@ -96,6 +113,41 @@ func longestCommonPrefix(strs []string) string {
 		}
 	}
 	return prefix
+}
+
+
+func insideQuotes(input []byte) bool {
+	inQuote := false
+	inDoubleQuote := false
+	slash := false
+	pendingEscape := false
+
+	for _, b := range input {
+		switch {
+		case slash:
+			slash = false
+		case inQuote:
+			if b == '\'' {
+				inQuote = false
+			}
+		case inDoubleQuote:
+			switch {
+			case pendingEscape:
+				pendingEscape = false
+			case b == '"':
+				inDoubleQuote = false
+			case b == '\\':
+				pendingEscape = true
+			}
+		case b == '\'':
+			inQuote = true
+		case b == '"':
+			inDoubleQuote = true
+		case b == '\\':
+			slash = true
+		}
+	}
+	return inQuote || inDoubleQuote
 }
 
 // readLine reads one line a byte at a time, handling Enter, Backspace, and Tab completion itself when stdin is a real terminal.
@@ -141,6 +193,15 @@ func readLine(reader *bufio.Reader) (string, error) {
 			}
 
 		case '\t':
+			
+			if insideQuotes(input) {
+				// A tab typed inside an open quote is literal data, not a completion trigger.
+				consecutiveTabs = 0
+				cycleMatches = nil
+				input = append(input, b)
+				break
+			}
+
 			// Tab: complete an unambiguous match, bell on no/first-ambiguous match, list on the 2nd press, then cycle (PowerShell-style) after that.
 			if cycleMatches != nil {
 				cycleIndex = (cycleIndex + 1) % len(cycleMatches)
@@ -150,12 +211,35 @@ func readLine(reader *bufio.Reader) (string, error) {
 
 			consecutiveTabs++
 
-			
 			prefix := ""
 			word := string(input) // assume no space
 			if idx := strings.LastIndex(string(input), " "); idx != -1 {
 				prefix = string(input[:idx+1])
 				word = string(input[idx+1:])
+			}
+
+			fields := strings.Fields(prefix) // every word already typed before the one being completed
+
+			if len(fields) > 0 {
+				if script, ok := completeSet[fields[0]]; ok {
+					prevWord := ""
+					if len(fields) > 1 {
+						prevWord = fields[len(fields)-1]
+					}
+
+					compLine := string(input)
+					compPoint := len(input) // no cursor movement in this shell, so Tab is always at the end
+
+					candidate, err := runCompleter(script, []string{fields[0], word, prevWord}, compLine, compPoint)
+					if err == nil && candidate != "" {
+						input = []byte(prefix + candidate + " ")
+					} else {
+						fmt.Print("\x07") // completer ran but returned no candidate, or failed to run
+					}
+					consecutiveTabs = 0
+					cycleMatches = nil
+					break
+				}
 			}
 
 			if prefix == "" {
@@ -201,6 +285,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 				}
 				break // to break out of bigger switch 
 			}
+			
 
 			// Later argument: complete against entries in the current working directory.
 			entries := matchingCWDEntries(word)

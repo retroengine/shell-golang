@@ -1860,3 +1860,218 @@ func chdirGuard(t *testing.T) string {
 	t.Cleanup(func() { os.Chdir(original) })
 	return original
 }
+
+// ============================================================
+// handleComplete — the -p flag on the complete builtin
+// ============================================================
+
+func TestHandleComplete_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+		why  string
+	}{
+		{
+			name: "git has no registered completion spec",
+			args: []string{"complete", "-p", "git"},
+			want: "complete: git: no completion specification",
+			why:  "spec: complete -p <command> prints 'complete: <command>: no completion specification' when nothing has been registered",
+		},
+		{
+			name: "a different command name is echoed back in the message",
+			args: []string{"complete", "-p", "docker"},
+			want: "complete: docker: no completion specification",
+			why:  "spec: the command name in the output matches the one passed to -p",
+		},
+		{
+			name: "a short command name is echoed back in the message",
+			args: []string{"complete", "-p", "ls"},
+			want: "complete: ls: no completion specification",
+			why:  "spec: the command name in the output matches the one passed to -p",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			got := handleComplete(tt.args)
+
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleComplete_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+		why  string
+	}{
+		{
+			name: "command name containing a hyphen is not mistaken for a flag",
+			args: []string{"complete", "-p", "git-lfs"},
+			want: "complete: git-lfs: no completion specification",
+			why:  "spec: only args[1] is checked against -p; whatever command name follows is printed as-is",
+		},
+		{
+			name: "command name that itself looks like a flag",
+			args: []string{"complete", "-p", "-C"},
+			want: "complete: -C: no completion specification",
+			why:  "spec: -p only recognises its own position; the word after it is treated purely as the command name",
+		},
+		{
+			name: "empty command name still fills the slot",
+			args: []string{"complete", "-p", ""},
+			want: "complete: : no completion specification",
+			why:  "spec gives no rule excluding an empty command name, so it is printed like any other",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			got := handleComplete(tt.args)
+
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleComplete_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "whitespace-only command name", args: []string{"complete", "-p", "   "}},
+		{name: "unicode command name", args: []string{"complete", "-p", "gít"}},
+		{name: "very long command name", args: []string{"complete", "-p", strings.Repeat("x", 500)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			// handleComplete has no error return; this just proves it
+			// returns cleanly (no panic) for unusual command-name content.
+			_ = handleComplete(tt.args)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
+		})
+	}
+}
+
+// ============================================================
+// handleComplete — the -C flag registers a completer, extending -p
+// to print it back in the normalized format
+// ============================================================
+
+func TestHandleComplete_RegisterC_Valid(t *testing.T) {
+	tests := []struct {
+		name         string
+		registerArgs []string
+		queryArgs    []string
+		want         string
+		why          string
+	}{
+		{
+			name:         "registering npm's completer, -p prints it back in the normalized format",
+			registerArgs: []string{"complete", "-C", "/path/to/npm/completer", "npm"},
+			queryArgs:    []string{"complete", "-p", "npm"},
+			want:         "complete -C '/path/to/npm/completer' npm",
+			why:          "spec: once a completion is registered, complete -p <command> should print it back in a normalized format",
+		},
+		{
+			name:         "a second, independently registered command is printed with its own path",
+			registerArgs: []string{"complete", "-C", "/usr/local/bin/kubectl-completer", "kubectl"},
+			queryArgs:    []string{"complete", "-p", "kubectl"},
+			want:         "complete -C '/usr/local/bin/kubectl-completer' kubectl",
+			why:          "spec: the script path is wrapped in single quotes and the command name follows it",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registerCall := cmdLine(tt.registerArgs)
+			registerGot := handleComplete(tt.registerArgs)
+			wantEqual(t, registerCall, registerGot, "", "spec: complete -C <path> <command> registers the completion and produces no output")
+
+			queryCall := cmdLine(tt.queryArgs)
+			queryGot := handleComplete(tt.queryArgs)
+			wantEqual(t, queryCall, queryGot, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleComplete_RegisterC_Edge(t *testing.T) {
+	tests := []struct {
+		name        string
+		registerSeq [][]string // one or more -C registrations, applied in order
+		queryArgs   []string
+		want        string
+		why         string
+	}{
+		{
+			name: "a path containing spaces is wrapped in single quotes verbatim",
+			registerSeq: [][]string{
+				{"complete", "-C", "/path/to/terraform completer with space", "terraform"},
+			},
+			queryArgs: []string{"complete", "-p", "terraform"},
+			want:      "complete -C '/path/to/terraform completer with space' terraform",
+			why:       "spec: the script path is wrapped in single quotes; whatever it contains is preserved verbatim inside them",
+		},
+		{
+			name: "re-registering the same command overwrites the previous completer",
+			registerSeq: [][]string{
+				{"complete", "-C", "/old/path/curl-completer", "curl"},
+				{"complete", "-C", "/new/path/curl-completer", "curl"},
+			},
+			queryArgs: []string{"complete", "-p", "curl"},
+			want:      "complete -C '/new/path/curl-completer' curl",
+			why:       "spec: -C registers the completer script for a command, so registering again for the same command replaces it",
+		},
+		{
+			name: "registering one command does not affect another command's completion",
+			registerSeq: [][]string{
+				{"complete", "-C", "/path/to/aws-completer", "aws"},
+				{"complete", "-C", "/path/to/gh-completer", "gh"},
+			},
+			queryArgs: []string{"complete", "-p", "aws"},
+			want:      "complete -C '/path/to/aws-completer' aws",
+			why:       "spec: each command's registration is independent, so registering gh does not change what -p aws prints",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, reg := range tt.registerSeq {
+				got := handleComplete(reg)
+				wantEqual(t, cmdLine(reg), got, "", "spec: complete -C <path> <command> registers the completion and produces no output")
+			}
+
+			call := cmdLine(tt.queryArgs)
+			got := handleComplete(tt.queryArgs)
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleComplete_RegisterC_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "unicode path", args: []string{"complete", "-C", "/pâth/tö/completer", "café"}},
+		{name: "very long path", args: []string{"complete", "-C", strings.Repeat("/x", 200), "longcmd"}},
+		{name: "path containing a single quote", args: []string{"complete", "-C", "/it's/here", "quotecmd"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			// handleComplete has no error return; this just proves -C registration
+			// returns cleanly (no panic) for unusual path content.
+			_ = handleComplete(tt.args)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
+		})
+	}
+}
