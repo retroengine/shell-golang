@@ -1611,6 +1611,308 @@ func TestE2E_CompleterScript_PassesCompEnv(t *testing.T) {
 	}
 }
 
+// buildFixedCandidatesCompleterScript compiles a completer program that
+// always prints the given candidates, one per line, in the exact order
+// given — so a test can control whether they arrive pre-sorted or not.
+func buildFixedCandidatesCompleterScript(t *testing.T, candidates []string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := fmt.Sprintf(`package main
+
+import "fmt"
+
+func main() {
+	for _, c := range %#v {
+		fmt.Println(c)
+	}
+}
+`, candidates)
+
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write completer source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "completer")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build completer script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// running the completer script — multiple candidates
+// ============================================================
+
+func TestE2E_CompleterScript_MultipleCandidates(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name       string
+		candidates []string // what the completer script prints, in this order
+		session    string   // %s is replaced with the completer's path
+		want       string
+		why        string
+	}{
+		{
+			name:       "first <TAB> rings the bell since there's no unique completion",
+			candidates: []string{"add", "commit", "push"},
+			session:    "complete -C '%s' git\ngit \t\n",
+			want:       "\x07",
+			why:        "spec: the first TAB should ring the terminal bell (since there's no unique completion)",
+		},
+		{
+			name:       "second <TAB> displays every candidate, space-separated",
+			candidates: []string{"add", "commit", "push"},
+			session:    "complete -C '%s' git\ngit \t\t\n",
+			want:       "add  commit  push",
+			why:        "spec: the second TAB should display all candidates on the next line, separated by at least one space",
+		},
+		{
+			name:       "candidates are sorted alphabetically regardless of the order the completer printed them",
+			candidates: []string{"push", "add", "commit"},
+			session:    "complete -C '%s' git\ngit \t\t\n",
+			want:       "add  commit  push",
+			why:        "spec: the second TAB should display all candidates sorted alphabetically",
+		},
+		{
+			name:       "the prompt and original input are reprinted after the candidate list",
+			candidates: []string{"add", "commit", "push"},
+			session:    "complete -C '%s' git\ngit \t\t\n",
+			want:       "$ git ",
+			why:        "spec: after displaying the candidates, the shell should reprint the prompt with the original input",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			completerPath := buildFixedCandidatesCompleterScript(t, tt.candidates)
+			session := fmt.Sprintf(tt.session, completerPath)
+			got := runShell(t, binary, session)
+			assertContainsWhy(t, session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// buildPrefixFilteringCompleterScript compiles a completer program that, given
+// its second argument (the word being completed — matching the shell's own
+// os.Args[2] convention, see runCompleter), prints only the candidates from
+// allCandidates that start with it. Unlike buildFixedCandidatesCompleterScript
+// (which always returns every candidate), this one narrows as more is typed,
+// letting a test drive a candidate list down to a single match.
+func buildPrefixFilteringCompleterScript(t *testing.T, allCandidates []string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := fmt.Sprintf(`package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
+func main() {
+	word := ""
+	if len(os.Args) > 2 {
+		word = os.Args[2]
+	}
+	for _, c := range %#v {
+		if strings.HasPrefix(c, word) {
+			fmt.Println(c)
+		}
+	}
+}
+`, allCandidates)
+
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write completer source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "completer")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build completer script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// running the completer script — longest common prefix completion
+// ============================================================
+
+func TestE2E_CompleterScript_LongestCommonPrefix(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name     string
+		filtered bool // true: completer narrows by the typed word; false: always returns both candidates
+		session  string // %s is replaced with the completer's path
+		want     string
+		why      string
+	}{
+		{
+			name:     "candidates sharing a prefix longer than what's typed complete silently to that prefix",
+			filtered: false,
+			session:  "complete -C '%s' echo\necho c\t\n",
+			want:     "che",
+			why:      "spec: checkout and cherry-pick share the prefix che, longer than the typed c, so the shell completes to che",
+		},
+		{
+			name:     "typing further to leave only one candidate completes the full word with a trailing space",
+			filtered: true,
+			session:  "complete -C '%s' echo\necho chec\t\n",
+			want:     "checkout",
+			why:      "spec: only checkout still matches once chec is typed, so TAB completes the full word",
+		},
+		{
+			name:     "the trailing space after completing the sole candidate starts a new argument",
+			filtered: true,
+			session:  "complete -C '%s' echo\necho chec\tX\n",
+			want:     "checkout X",
+			why:      "spec: completing to the sole candidate is followed by a trailing space, so text typed next (X) becomes a separate argument",
+		},
+		{
+			name:     "an LCP equal to what's already typed is treated as no common prefix: bell, then list on the next TAB",
+			filtered: false,
+			session:  "complete -C '%s' echo\necho che\t\t\n",
+			want:     "checkout  cherry-pick",
+			why:      "notes: if the LCP equals what the user has already typed, treat it the same as no common prefix — ring the bell and display candidates on the next TAB",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var completerPath string
+			if tt.filtered {
+				completerPath = buildPrefixFilteringCompleterScript(t, []string{"checkout", "cherry-pick"})
+			} else {
+				completerPath = buildFixedCandidatesCompleterScript(t, []string{"checkout", "cherry-pick"})
+			}
+			session := fmt.Sprintf(tt.session, completerPath)
+			got := runShell(t, binary, session)
+			assertContainsWhy(t, session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// running the completer script — no bell when the LCP extends the input
+// ============================================================
+
+func TestE2E_CompleterScript_LongestCommonPrefix_NoBell(t *testing.T) {
+	binary := buildTestBinary(t)
+	completerPath := buildFixedCandidatesCompleterScript(t, []string{"checkout", "cherry-pick"})
+
+	session := fmt.Sprintf("complete -C '%s' echo\necho c\t\n", completerPath)
+	why := "spec: no bell rings when the LCP extends the current input"
+
+	got := runShell(t, binary, session)
+	call := typedSession(session)
+
+	if strings.Contains(got, "\x07") {
+		t.Error(failLine(call, "no bell (the LCP extends the input)", show(got), why))
+	} else {
+		t.Logf("%s %s\n    expected: no bell (the LCP extends the input)\n    received: %s", markPass, call, show(got))
+	}
+}
+
+// ============================================================
+// complete -r (remove a registered completion)
+// ============================================================
+
+func TestE2E_CompleteDashR(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "removing a registered completion makes -p report none registered",
+			session: "complete -C /path/to/yarn/completer yarn\ncomplete -r yarn\ncomplete -p yarn\n",
+			want:    "complete: yarn: no completion specification",
+			why:     "spec: complete -r <command> removes any stored completion rule for that command",
+		},
+		{
+			name:    "removing one command's rule leaves a different command's registration intact",
+			session: "complete -C /path/to/helm/completer helm\ncomplete -r terraform\ncomplete -p helm\n",
+			want:    "complete -C '/path/to/helm/completer' helm",
+			why:     "spec: -r removes the rule for the named command; an unrelated command's registration must survive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestE2E_CompleteDashR_NoOutput(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		why     string
+	}{
+		{
+			name:    "removing a registered completion produces no output",
+			session: "complete -C /path/to/git/completer git\ncomplete -r git\nexit\n",
+			why:     "spec: the command should produce no output on success",
+		},
+		{
+			name:    "removing a command with no completion registered is still not an error",
+			session: "complete -r nosuchcmd\nexit\n",
+			why:     "notes: if complete -r is called for a command that has no completion registered, the shell should still produce no output and not treat it as an error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			if strings.Contains(got, "complete") {
+				t.Error(failLine(typedSession(tt.session), "no output containing \"complete\"", got, tt.why))
+			} else {
+				t.Logf("%s %s\n    expected: no output containing \"complete\"\n    received: %s", markPass, typedSession(tt.session), show(got))
+			}
+		})
+	}
+}
+
+func TestE2E_CompleteDashR_TabNoLongerCompletes(t *testing.T) {
+	binary := buildTestBinary(t)
+	completerPath := buildCompleterScript(t, "checkout", 0)
+
+	session := fmt.Sprintf("complete -C '%s' git\ncomplete -r git\ngit \t\n", completerPath)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "\x07",
+		"spec: after complete -r git, pressing TAB for git should behave as if no completion was ever registered, so the bell rings")
+
+	if strings.Contains(got, "checkout") {
+		t.Error(failLine(typedSession(session), "no completion from the removed script", got,
+			"spec: complete -r removes the stored completion rule, so its candidate must not appear after removal"))
+	} else {
+		t.Logf("%s %s\n    expected: no completion from the removed script\n    received: %s", markPass, typedSession(session), show(got))
+	}
+}
+
 // ============================================================
 // helpers
 // ============================================================

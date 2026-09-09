@@ -14,19 +14,19 @@ import (
 
 // The words <TAB> is allowed to complete.
 var autocompleteCommands = []string{
-"alias", "apropos", "awk", "basename", "bash", "bc", "bg", "bind", "break", "builtin",
-"caller", "cat", "cd", "chgrp", "chmod", "chown", "cksum", "clear", "cmp", "comm", "command",
-"compgen", "complete", "continue", "cp", "cron", "cut", "date", "dd", "declare", "df", "diff",
-"dirname", "dirs", "disown", "du", "echo", "egrep", "enable", "env", "eval", "exec", "exit",
-"export", "false", "fg", "fgrep", "file", "find", "fold", "for", "free", "getopts", "grep",
-"groups", "gunzip", "gzip", "head", "help", "history", "hostname", "id", "if", "jobs", "join",
-"kill", "killall", "less", "let", "ln", "locate", "logout", "ls", "lsof", "make", "man", "mkdir",
-"mkfifo", "more", "mount", "mv", "nice", "nohup", "passwd", "paste", "pathchk", "ping", "printf",
-"ps", "pwd", "read", "readlink", "readonly", "realpath", "renice", "return", "rm", "rmdir", "sed",
-"seq", "set", "shift", "shopt", "shutdown", "sleep", "sort", "source", "split", "ssh", "stat", "strings",
-"su", "sudo", "tail", "tar", "tee", "test", "time", "timeout", "top", "touch", "tr", "trap", "true",
-"type", "ulimit", "umask", "unalias", "uname", "uniq", "unset", "unzip", "uptime", "users", "wc", "whereis",
-"which", "who", "whoami", "xargs", "yes", "zip", "jobs"}
+	"alias", "apropos", "awk", "basename", "bash", "bc", "bg", "bind", "break", "builtin",
+	"caller", "cat", "cd", "chgrp", "chmod", "chown", "cksum", "clear", "cmp", "comm", "command",
+	"compgen", "complete", "continue", "cp", "cron", "cut", "date", "dd", "declare", "df", "diff",
+	"dirname", "dirs", "disown", "du", "echo", "egrep", "enable", "env", "eval", "exec", "exit",
+	"export", "false", "fg", "fgrep", "file", "find", "fold", "for", "free", "getopts", "grep",
+	"groups", "gunzip", "gzip", "head", "help", "history", "hostname", "id", "if", "jobs", "join",
+	"kill", "killall", "less", "let", "ln", "locate", "logout", "ls", "lsof", "make", "man", "mkdir",
+	"mkfifo", "more", "mount", "mv", "nice", "nohup", "passwd", "paste", "pathchk", "ping", "printf",
+	"ps", "pwd", "read", "readlink", "readonly", "realpath", "renice", "return", "rm", "rmdir", "sed",
+	"seq", "set", "shift", "shopt", "shutdown", "sleep", "sort", "source", "split", "ssh", "stat", "strings",
+	"su", "sudo", "tail", "tar", "tee", "test", "time", "timeout", "top", "touch", "tr", "trap", "true",
+	"type", "ulimit", "umask", "unalias", "uname", "uniq", "unset", "unzip", "uptime", "users", "wc", "whereis",
+	"which", "who", "whoami", "xargs", "yes", "zip", "jobs"}
 
 // handleAutocomplete returns partial's match completed with a trailing space, or "" if none match.
 func handleAutocomplete(partial string) string {
@@ -88,8 +88,7 @@ func matchingCWDEntries(partial string) []os.DirEntry {
 	return matches
 }
 
-
-func runCompleter(script string, args []string, compLine string, compPoint int) (string, error) {
+func runCompleter(script string, args []string, compLine string, compPoint int) ([]string, error) {
 	cmd := exec.Command(script, args...)
 	cmd.Env = append(os.Environ(),
 		"COMP_LINE="+compLine,
@@ -98,10 +97,19 @@ func runCompleter(script string, args []string, compLine string, compPoint int) 
 
 	out, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	line := strings.SplitN(string(out), "\n", 2)[0]
-	return strings.TrimRight(line, "\r"), nil
+	var candidates []string
+
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimRight(line, "\r")
+
+		if line != "" {
+			candidates = append(candidates, line)
+		}
+	}
+
+	return candidates, nil
 }
 
 // longestCommonPrefix returns the longest prefix shared by every string in strs (strs must be non-empty).
@@ -114,7 +122,6 @@ func longestCommonPrefix(strs []string) string {
 	}
 	return prefix
 }
-
 
 func insideQuotes(input []byte) bool {
 	inQuote := false
@@ -193,7 +200,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 			}
 
 		case '\t':
-			
+
 			if insideQuotes(input) {
 				// A tab typed inside an open quote is literal data, not a completion trigger.
 				consecutiveTabs = 0
@@ -221,6 +228,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 			fields := strings.Fields(prefix) // every word already typed before the one being completed
 
 			if len(fields) > 0 {
+
 				if script, ok := completeSet[fields[0]]; ok {
 					prevWord := ""
 					if len(fields) > 1 {
@@ -231,14 +239,37 @@ func readLine(reader *bufio.Reader) (string, error) {
 					compPoint := len(input) // no cursor movement in this shell, so Tab is always at the end
 
 					candidate, err := runCompleter(script, []string{fields[0], word, prevWord}, compLine, compPoint)
-					if err == nil && candidate != "" {
-						input = []byte(prefix + candidate + " ")
-					} else {
-						fmt.Print("\x07") // completer ran but returned no candidate, or failed to run
+
+					sort.Strings(candidate)
+
+					switch {
+					case err != nil || len(candidate) == 0:
+						fmt.Print("\x07")
+						consecutiveTabs = 0
+					case len(candidate) == 1:
+						input = []byte(prefix + candidate[0] + " ")
+						consecutiveTabs = 0
+					default: // 2+ candidates
+						if consecutiveTabs < 2 {
+							lcp := longestCommonPrefix(candidate)
+							if len(lcp) > len(word){
+								input = []byte(prefix + lcp)
+								consecutiveTabs = 0
+								break
+							}else{
+								fmt.Print("\x07")
+							}
+							
+						}
+						if isTerm {
+							fmt.Printf("\r\n%s\r\n\033[K$ %s", strings.Join(candidate, "  "), string(input))
+						} else {
+							fmt.Printf("\n%s\n$ %s", strings.Join(candidate, "  "), string(input))
+						}
+						consecutiveTabs = 0
 					}
-					consecutiveTabs = 0
-					cycleMatches = nil
-					break
+					continue
+
 				}
 			}
 
@@ -262,7 +293,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 					consecutiveTabs = 0
 				default: // 2+ matches
 					if lcp := longestCommonPrefix(matches); len(lcp) > len(word) {
-						input = []byte(lcp) // multiple then go for longest prefix file 
+						input = []byte(lcp) // multiple then go for longest prefix file
 						consecutiveTabs = 0
 						break
 					}
@@ -283,9 +314,8 @@ func readLine(reader *bufio.Reader) (string, error) {
 					cycleIndex = -1 // the next Tab press lands on index 0
 					continue        // prompt already redrawn above; skip the redraw below
 				}
-				break // to break out of bigger switch 
+				break // to break out of bigger switch
 			}
-			
 
 			// Later argument: complete against entries in the current working directory.
 			entries := matchingCWDEntries(word)

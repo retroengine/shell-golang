@@ -164,6 +164,13 @@ func handleComplete(args []string) string {
 			return fmt.Sprintf("complete -C '%s' %s", val, args[2])
 		}
 
+	case "-r":
+		if len(args) < 3 {
+			return "In-Valid number of arguments"
+		}
+		delete(completeSet, args[2])
+		return ""
+
 	default:
 		return fmt.Sprintf("complete: %s: no completion specification", args[1])
 	}

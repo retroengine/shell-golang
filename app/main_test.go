@@ -2075,3 +2075,223 @@ func TestHandleComplete_RegisterC_NeverErrors(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================
+// longestCommonPrefix
+// ============================================================
+
+func TestLongestCommonPrefix_Valid(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+		want       string
+		why        string
+	}{
+		{
+			name:       "two candidates sharing a prefix longer than what's typed",
+			candidates: []string{"checkout", "cherry-pick"},
+			want:       "che",
+			why:        "spec: checkout and cherry-pick share the prefix che, so the shell completes to che",
+		},
+		{
+			name:       "a single candidate is its own longest common prefix",
+			candidates: []string{"checkout"},
+			want:       "checkout",
+			why:        "spec: the LCP is computed from the candidates returned by the completer — with one candidate, that candidate is the prefix",
+		},
+		{
+			name:       "identical candidates share themselves as the prefix",
+			candidates: []string{"push", "push", "push"},
+			want:       "push",
+			why:        "spec: the LCP is computed from the candidates, not from a hardcoded list",
+		},
+		{
+			name:       "candidate order does not affect the computed prefix",
+			candidates: []string{"remote-rm", "remote", "remote-add"},
+			want:       "remote",
+			why:        "spec: the LCP is computed from the candidates returned by the completer, regardless of the order they were returned in",
+		},
+		{
+			name:       "no shared prefix yields an empty LCP",
+			candidates: []string{"add", "commit", "push"},
+			want:       "",
+			why:        "spec: if the candidates don't share a prefix, there is no LCP to complete to",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.candidates)
+			got := longestCommonPrefix(tt.candidates)
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestLongestCommonPrefix_Edge(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+		want       string
+		why        string
+	}{
+		{
+			name:       "shared prefix is case-sensitive",
+			candidates: []string{"Checkout", "checkout"},
+			want:       "",
+			why:        "spec gives no case-folding rule, so a differing case at the first character yields no shared prefix",
+		},
+		{
+			name:       "one candidate is a prefix of the other",
+			candidates: []string{"co", "commit"},
+			want:       "co",
+			why:        "the shorter candidate is entirely consumed as the prefix; the search cannot run past the shortest candidate's length",
+		},
+		{
+			name:       "an empty-string candidate forces an empty prefix",
+			candidates: []string{"", "commit"},
+			want:       "",
+			why:        "an empty candidate shares nothing with any other candidate, so the LCP collapses to empty",
+		},
+		{
+			name:       "prefix search stops at the shortest candidate's length",
+			candidates: []string{"go", "golang", "gopher"},
+			want:       "go",
+			why:        "go is the shortest candidate, so the LCP cannot extend past it even though the others share more",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.candidates)
+			got := longestCommonPrefix(tt.candidates)
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestLongestCommonPrefix_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+	}{
+		{name: "single one-character candidate", candidates: []string{"x"}},
+		{name: "many candidates with no shared prefix", candidates: []string{"a", "b", "c", "d", "e"}},
+		{name: "unicode candidates", candidates: []string{"日本語", "日本"}},
+		{name: "candidates containing embedded spaces", candidates: []string{"a b", "a c"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.candidates)
+			// longestCommonPrefix has no error return; this just proves it
+			// returns cleanly (no panic) for input outside the happy path.
+			_ = longestCommonPrefix(tt.candidates)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
+		})
+	}
+}
+
+// ============================================================
+// handleComplete — the -r flag removes a registered completion
+// ============================================================
+
+func TestHandleComplete_RemoveR_Valid(t *testing.T) {
+	tests := []struct {
+		name         string
+		registerArgs []string
+		removeArgs   []string
+		queryArgs    []string
+		want         string
+		why          string
+	}{
+		{
+			name:         "removing a registered completion makes -p report none registered",
+			registerArgs: []string{"complete", "-C", "/path/to/yarn/completer", "yarn"},
+			removeArgs:   []string{"complete", "-r", "yarn"},
+			queryArgs:    []string{"complete", "-p", "yarn"},
+			want:         "complete: yarn: no completion specification",
+			why:          "spec: the complete builtin accepts -r followed by a command name, which removes any stored completion rule for that command",
+		},
+		{
+			name:         "removing one command's rule leaves a different command's registration intact",
+			registerArgs: []string{"complete", "-C", "/path/to/helm/completer", "helm"},
+			removeArgs:   []string{"complete", "-r", "terraform"},
+			queryArgs:    []string{"complete", "-p", "helm"},
+			want:         "complete -C '/path/to/helm/completer' helm",
+			why:          "spec: -r removes the rule for the named command; an unrelated command's registration must survive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registerCall := cmdLine(tt.registerArgs)
+			registerGot := handleComplete(tt.registerArgs)
+			wantEqual(t, registerCall, registerGot, "", "spec: complete -C <path> <command> registers the completion and produces no output")
+
+			removeCall := cmdLine(tt.removeArgs)
+			removeGot := handleComplete(tt.removeArgs)
+			wantEqual(t, removeCall, removeGot, "", "spec: the command should produce no output on success")
+
+			queryCall := cmdLine(tt.queryArgs)
+			queryGot := handleComplete(tt.queryArgs)
+			wantEqual(t, queryCall, queryGot, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleComplete_RemoveR_Edge(t *testing.T) {
+	tests := []struct {
+		name      string
+		removeSeq [][]string // one or more -r removals, applied in order
+		queryArgs []string
+		want      string
+		why       string
+	}{
+		{
+			name:      "removing a command that was never registered produces no output and is not an error",
+			removeSeq: [][]string{{"complete", "-r", "neverseen"}},
+			queryArgs: []string{"complete", "-p", "neverseen"},
+			want:      "complete: neverseen: no completion specification",
+			why:       "notes: if complete -r is called for a command that has no completion registered, the shell should still produce no output and not treat it as an error",
+		},
+		{
+			name:      "removing the same command twice in a row is still a no-op the second time",
+			removeSeq: [][]string{{"complete", "-r", "vim"}, {"complete", "-r", "vim"}},
+			queryArgs: []string{"complete", "-p", "vim"},
+			want:      "complete: vim: no completion specification",
+			why:       "notes: a second -r for an already-unregistered command must not error either",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, remove := range tt.removeSeq {
+				got := handleComplete(remove)
+				wantEqual(t, cmdLine(remove), got, "", "spec: the command should produce no output on success")
+			}
+
+			call := cmdLine(tt.queryArgs)
+			got := handleComplete(tt.queryArgs)
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleComplete_RemoveR_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "unicode command name", args: []string{"complete", "-r", "gít"}},
+		{name: "very long command name", args: []string{"complete", "-r", strings.Repeat("x", 500)}},
+		{name: "whitespace-only command name", args: []string{"complete", "-r", "   "}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			// handleComplete has no error return; this just proves -r removal
+			// returns cleanly (no panic) for unusual command-name content.
+			_ = handleComplete(tt.args)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
+		})
+	}
+}
