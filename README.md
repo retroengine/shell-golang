@@ -174,11 +174,11 @@ of one command from keystroke to output.
 
 ## Testing
 
-Three layers, 106 test functions in total:
+Three layers, 114 test functions in total:
 
 | Layer | File | What it checks |
 |---|---|---|
-| **Unit** | `app/main_test.go` | 53 table-driven tests, one function per handler, so a `handleCD` bug shows up as a `handleCD` failure. |
+| **Unit** | `app/main_test.go` | 61 table-driven tests covering every handler and the redirect and completion helpers, so a `handleCD` bug shows up as a `handleCD` failure. |
 | **End-to-end** | `app/e2e_test.go` | 50 tests that build the real binary, type a whole session into it, and check what came back. |
 | **Fuzz** | `app/fuzz_test.go` | 3 targets throwing random input at the parser and builtins, looking for crashes. |
 
@@ -207,7 +207,7 @@ session rather than a wall of stack traces:
 
 | Mode | Runs |
 |---|---|
-| `unit` | The unit tests only. |
+| `unit` | Every test except the end-to-end ones. |
 | `e2e` | The end-to-end tests only. |
 | `all` *(default)* | `go vet` plus everything. |
 | `cover` | Everything, plus an HTML coverage report at `app/coverage.html`. |
@@ -234,9 +234,6 @@ for `[PASS]`/`[FAIL]` on consoles that can't render them.
 - **Completion doesn't understand quotes.** It splits on plain spaces, so a
   half-typed quoted filename won't match anything. (A Tab pressed *inside* a
   quote is correctly inserted as a real tab, though.)
-- **`type complete` says "not found."** The builtin is registered under a name
-  with a stray trailing space ([main.go:18](app/main.go#L18)), so `type` misses
-  it. `complete` itself works fine.
 - **Custom completions list too eagerly.** When a registered script returns
   several suggestions that share no common start, the first `Tab` beeps *and*
   lists them, instead of waiting for a second `Tab` like the other sources do.

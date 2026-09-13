@@ -8,7 +8,9 @@ MODE="${1:-all}"
 case "$MODE" in
   unit)
     echo "==> unit tests"
-    go test -run TestHandle -v ./...
+    # Every Test* except the end-to-end ones: covers the TestHandle* handler
+    # blocks plus helper blocks like TestWriteOutput*/TestTouchTarget*.
+    go test -run '^Test' -skip '^TestE2E' -v ./...
     ;;
   e2e)
     echo "==> end-to-end tests"

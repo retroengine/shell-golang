@@ -15,7 +15,7 @@ func main() {
 		"exit": "exiting",
 		"pwd":  "get working directory",
 		"cd":   "change directory",
-		"complete ": "registers autocompletion for given word",
+		"complete": "registers autocompletion for given word",
 	}
 
 	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
@@ -41,6 +41,13 @@ func main() {
 		}
 		args = cmdArgs
 
+		if len(args) == 0 { // a redirect with no command in front of it: create or truncate the target, run nothing
+			if err := touchTarget(redirectTarget, mode); err != nil {
+				printLine(err.Error())
+			}
+			continue
+		}
+
 		switch args[0] {
 		case "exit":
 			break shellLoop // exits the outer "for"; a bare break here would only exit this switch
@@ -48,7 +55,9 @@ func main() {
 		case "echo":
 			cleanStr, _ := handleEcho(args) // handleEcho never errors
 			if mode == 1 || mode == 3 {     // stdout redirect requested (truncate or append)
-				writeOutput(redirectTarget, cleanStr,mode)
+				if werr := writeOutput(redirectTarget, cleanStr, mode); werr != nil {
+					printLine(werr.Error())
+				}
 			} else {
 				printLine(cleanStr)
 			}
@@ -58,7 +67,9 @@ func main() {
 
 			if err != nil {
 				if mode == 2 || mode == 4{ // stderr redirect requested
-					writeError(redirectTarget, err,mode)
+					if werr := writeError(redirectTarget, err, mode); werr != nil {
+						printLine(werr.Error())
+					}
 				} else {
 					printLine(fmt.Sprintf("Error printing the working directory %s", err))
 				}
@@ -66,7 +77,9 @@ func main() {
 			}
 
 			if mode == 1 || mode == 3{ // stdout redirect requested
-				writeOutput(redirectTarget, dirName, mode)
+				if werr := writeOutput(redirectTarget, dirName, mode); werr != nil {
+					printLine(werr.Error())
+				}
 			} else {
 				printLine(dirName)
 			}
@@ -82,14 +95,18 @@ func main() {
 			typeString, err := handleTYPE(args, builtInSet)
 			if err != nil {
 				if mode == 2 || mode == 4 { // stderr redirect requested
-					writeError(redirectTarget, err,mode)
+					if werr := writeError(redirectTarget, err, mode); werr != nil {
+						printLine(werr.Error())
+					}
 				} else {
 					printLine(err.Error())
 				}
 				break
 			}
 			if mode == 1 || mode == 3 { // stdout redirect requested
-				writeOutput(redirectTarget, typeString,mode)
+				if werr := writeOutput(redirectTarget, typeString, mode); werr != nil {
+					printLine(werr.Error())
+				}
 			} else {
 				printLine(typeString)
 			}
@@ -100,13 +117,14 @@ func main() {
 			if strComplete != "" {
 				printLine(strComplete)
 			}
-		
-		
+
 		default: // not a builtin: resolve and run as an external program
 			msg, err := handleExecFile(args, redirectTarget, mode)
 
-			if msg != "" || err != nil {
+			if err != nil {
 				printLine(err.Error())
+			} else if msg != "" {
+				printLine(msg)
 			}
 
 		}

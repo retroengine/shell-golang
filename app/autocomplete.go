@@ -26,7 +26,7 @@ var autocompleteCommands = []string{
 	"seq", "set", "shift", "shopt", "shutdown", "sleep", "sort", "source", "split", "ssh", "stat", "strings",
 	"su", "sudo", "tail", "tar", "tee", "test", "time", "timeout", "top", "touch", "tr", "trap", "true",
 	"type", "ulimit", "umask", "unalias", "uname", "uniq", "unset", "unzip", "uptime", "users", "wc", "whereis",
-	"which", "who", "whoami", "xargs", "yes", "zip", "jobs"}
+	"which", "who", "whoami", "xargs", "yes", "zip"}
 
 // handleAutocomplete returns partial's match completed with a trailing space, or "" if none match.
 func handleAutocomplete(partial string) string {

@@ -16,4 +16,9 @@ coverage.html
 # Editor / OS
 .DS_Store
 .idea/
+.vscode/
 *.swp
+*.bak
+
+# Local tooling
+.claude/settings.local.json

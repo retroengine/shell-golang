@@ -45,7 +45,7 @@ func printLine(s string) {
 	}
 }
 
-func writeOutput(target, s string , mode int) error {
+func writeOutput(target, s string, mode int) error {
 
 	if target == "" {
 		printLine(s)
@@ -62,7 +62,7 @@ func writeOutput(target, s string , mode int) error {
 		}
 		defer f.Close()
 
-		_ , err = f.WriteString(s + "\n")
+		_, err = f.WriteString(s + "\n")
 
 		if err != nil {
 			return err
@@ -72,7 +72,7 @@ func writeOutput(target, s string , mode int) error {
 	return nil
 }
 
-func writeError(target string, err error,mode int) error {
+func writeError(target string, err error, mode int) error {
 	if err == nil {
 		return nil
 	}
@@ -85,20 +85,44 @@ func writeError(target string, err error,mode int) error {
 	if mode == 2 { // truncate
 		return os.WriteFile(target, []byte(err.Error()+"\n"), 0644)
 	} else { // append
-		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		// openErr/writeErr, not err: a := on err here would shadow the error
+		// parameter, leaving err.Error() below to dereference a nil interface.
+		f, openErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 
-		if err != nil {
-			return err
+		if openErr != nil {
+			return openErr
 		}
 		defer f.Close()
 
-		_ , err = f.WriteString(err.Error() + "\n")
+		_, writeErr := f.WriteString(err.Error() + "\n")
 
-		if err != nil {
-			return err
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 
 	return nil
 
+}
+
+// touchTarget creates target without writing anything, truncating it for the truncate modes.
+// This is what a redirect with no command in front of it does: "> out.txt" leaves an empty
+// out.txt behind, while ">> out.txt" only creates the file if it is missing.
+func touchTarget(target string, mode int) error {
+	if target == "" || mode == 0 {
+		return nil
+	}
+
+	flags := os.O_WRONLY | os.O_CREATE
+	if mode == 1 || mode == 2 { // truncate modes replace the file; append modes leave it alone
+		flags |= os.O_TRUNC
+	}
+
+	f, err := os.OpenFile(target, flags, 0644)
+
+	if err != nil {
+		return err
+	}
+
+	return f.Close()
 }

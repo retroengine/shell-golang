@@ -17,7 +17,9 @@ Set-Location (Join-Path $PSScriptRoot 'app')
 switch ($Mode) {
     'unit' {
         Write-Host '==> unit tests'
-        go test -run TestHandle -v ./...
+        # Every Test* except the end-to-end ones: covers the TestHandle* handler
+        # blocks plus helper blocks like TestWriteOutput*/TestTouchTarget*.
+        go test -run '^Test' -skip '^TestE2E' -v ./...
     }
     'e2e' {
         Write-Host '==> end-to-end tests'

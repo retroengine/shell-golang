@@ -570,11 +570,17 @@ func TestE2E_CD_ThenPWD(t *testing.T) {
 	binary := buildTestBinary(t)
 	tmp := t.TempDir()
 
-	session := fmt.Sprintf("cd '%s'\npwd\n", filepath.ToSlash(tmp))
+	// pwd reports os.Getwd(), the kernel-canonical path, so the expected value
+	// must be resolved too: macOS $TMPDIR is /var/folders/... while Getwd says
+	// /private/var/folders/..., and Windows may hand back a short 8.3 path.
+	resolved, err := filepath.EvalSymlinks(tmp)
+	if err != nil {
+		t.Fatalf("cannot resolve temp dir %q: %v", tmp, err)
+	}
+
+	session := fmt.Sprintf("cd '%s'\npwd\n", filepath.ToSlash(resolved))
 	got := runShell(t, binary, session)
-	// pwd reports the OS-native path, so assert against tmp (native
-	// separators), not the forward-slash form used to type the session.
-	assertContains(t, session, got, tmp)
+	assertContains(t, session, got, resolved)
 }
 
 func TestE2E_CD_MustFail(t *testing.T) {

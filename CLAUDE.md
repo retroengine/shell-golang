@@ -231,7 +231,7 @@ Tell the user: `./test.sh unit` for unit, `./test.sh e2e` for e2e.
 
 | Mode | Command | Runs |
 |---|---|---|
-| unit | `./test.sh unit` | `TestHandle*` |
+| unit | `./test.sh unit` | all `Test*` except `TestE2E*` |
 | e2e | `./test.sh e2e` | `TestE2E*` |
 | all | `./test.sh all` | vet + everything |
 | cover | `./test.sh cover` | all + HTML coverage |

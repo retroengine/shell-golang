@@ -2295,3 +2295,307 @@ func TestHandleComplete_RemoveR_NeverErrors(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================
+// touchTarget
+// ============================================================
+//
+// touchTarget is what the dispatch loop reaches for when a redirect has no
+// command in front of it ("> out.txt"). It creates the target and writes
+// nothing, so the truncate modes leave an empty file behind and the append
+// modes leave whatever was already there untouched.
+
+func TestTouchTarget_Valid(t *testing.T) {
+	tests := []struct {
+		name   string
+		op     string // the operator as it would be typed, for the call label
+		mode   int
+		seeded bool // whether the target already exists when touchTarget runs
+		seed   string
+		want   string // the file's contents afterwards
+		why    string
+	}{
+		{
+			name: "> creates a missing file, empty",
+			op:   ">", mode: 1, want: "",
+			why: "spec: if the file doesn't exist, it is created; no command ran, so nothing is written into it",
+		},
+		{
+			name: "1> creates a missing file, empty",
+			op:   "1>", mode: 1, want: "",
+			why:  "spec: 1 is the file descriptor for standard output, so 1> and > do exactly the same thing",
+		},
+		{
+			name: "2> creates a missing file, empty",
+			op:   "2>", mode: 2, want: "",
+			why:  "spec: 2> creates its target the same way > does",
+		},
+		{
+			name: "> empties a file that already exists",
+			op:   ">", mode: 1, seeded: true, seed: "old contents", want: "",
+			why:  "spec: if the file already exists, it is overwritten, replacing its old contents",
+		},
+		{
+			name: "2> empties a file that already exists",
+			op:   "2>", mode: 2, seeded: true, seed: "old contents", want: "",
+			why:  "spec: 2> truncates its target just as > does",
+		},
+		{
+			name: ">> creates a missing file, empty",
+			op:   ">>", mode: 3, want: "",
+			why:  "spec: >> creates the file if it does not exist",
+		},
+		{
+			name: ">> leaves the contents of an existing file alone",
+			op:   ">>", mode: 3, seeded: true, seed: "old contents", want: "old contents",
+			why:  "spec: >> adds to the end of the file rather than replacing it, so appending nothing changes nothing",
+		},
+		{
+			name: "2>> leaves the contents of an existing file alone",
+			op:   "2>>", mode: 4, seeded: true, seed: "old contents", want: "old contents",
+			why:  "spec: 2>> preserves what is already in the file, just as >> does",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "target.txt")
+			if tt.seeded {
+				if err := os.WriteFile(target, []byte(tt.seed), 0644); err != nil {
+					t.Fatalf("setup: cannot seed %q: %v", target, err)
+				}
+			}
+
+			call := cmdLine([]string{tt.op, filepath.Base(target)})
+			mustNoErr(t, call, touchTarget(target, tt.mode), tt.why)
+
+			data, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("setup: cannot read back %q: %v", target, err)
+			}
+			wantEqual(t, call, string(data), tt.want, tt.why)
+		})
+	}
+}
+
+func TestTouchTarget_Edge(t *testing.T) {
+	t.Run("mode 0 creates nothing", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "target.txt")
+		why := "mode 0 is what extractRedirect returns when the line held no operator, so no file may appear"
+		call := typed("echo hello\n") + " (no redirect, so mode 0)"
+
+		mustNoErr(t, call, touchTarget(target, 0), why)
+
+		got := "no file"
+		if _, err := os.Stat(target); err == nil {
+			got = "file created"
+		}
+		wantEqual(t, call, got, "no file", why)
+	})
+
+	t.Run("empty target creates nothing", func(t *testing.T) {
+		why := "an empty target is what extractRedirect returns when there was no operator, so there is no name to create"
+		call := typed("echo hello\n") + " (empty redirect target)"
+
+		mustNoErr(t, call, touchTarget("", 1), why)
+	})
+}
+
+func TestTouchTarget_MustFail(t *testing.T) {
+	tests := []struct {
+		name string
+		op   string
+		mode int
+		why  string
+	}{
+		{name: "> onto a directory", op: ">", mode: 1, why: "a directory cannot be opened for writing, and the shell must be told so rather than failing silently"},
+		{name: "2> onto a directory", op: "2>", mode: 2, why: "a directory cannot be opened for writing, and the shell must be told so rather than failing silently"},
+		{name: ">> onto a directory", op: ">>", mode: 3, why: "a directory cannot be opened for writing, and the shell must be told so rather than failing silently"},
+		{name: "2>> onto a directory", op: "2>>", mode: 4, why: "a directory cannot be opened for writing, and the shell must be told so rather than failing silently"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The target exists but is a directory. No wantErrContains here:
+			// the wording of the refusal belongs to the operating system.
+			dir := t.TempDir()
+			call := cmdLine([]string{tt.op, filepath.Base(dir)})
+
+			mustErr(t, call, touchTarget(dir, tt.mode), tt.why)
+		})
+	}
+}
+
+// ============================================================
+// writeOutput / writeError
+// ============================================================
+//
+// These are the two writers the dispatch loop hands a builtin's output to
+// when a redirect is in play. Both return an error the loop is expected to
+// report, so the MUST FAIL tables below pin down that the error is real.
+
+func TestWriteOutput_Valid(t *testing.T) {
+	tests := []struct {
+		name   string
+		op     string
+		mode   int
+		text   string
+		seeded bool
+		seed   string
+		want   string
+		why    string
+	}{
+		{
+			name: "> writes the text followed by a newline",
+			op:   ">", mode: 1, text: "hello", want: "hello\n",
+			why: "spec: the output that would normally appear on the terminal is written to the file instead",
+		},
+		{
+			name: "> replaces what the file already held",
+			op:   ">", mode: 1, text: "new contents", seeded: true, seed: "old contents\n", want: "new contents\n",
+			why: "spec: if the file already exists, it is overwritten, replacing its old contents",
+		},
+		{
+			name: ">> adds to the end of an existing file",
+			op:   ">>", mode: 3, text: "second", seeded: true, seed: "first\n", want: "first\nsecond\n",
+			why: "spec: >> adds to the end of the file rather than replacing it",
+		},
+		{
+			name: ">> creates the file when it does not exist",
+			op:   ">>", mode: 3, text: "only line", want: "only line\n",
+			why: "spec: >> creates the file if it does not exist",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "target.txt")
+			if tt.seeded {
+				if err := os.WriteFile(target, []byte(tt.seed), 0644); err != nil {
+					t.Fatalf("setup: cannot seed %q: %v", target, err)
+				}
+			}
+
+			call := cmdLine([]string{"echo", tt.text, tt.op, filepath.Base(target)})
+			mustNoErr(t, call, writeOutput(target, tt.text, tt.mode), tt.why)
+
+			data, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("setup: cannot read back %q: %v", target, err)
+			}
+			wantEqual(t, call, string(data), tt.want, tt.why)
+		})
+	}
+}
+
+func TestWriteOutput_MustFail(t *testing.T) {
+	tests := []struct {
+		name string
+		op   string
+		mode int
+		why  string
+	}{
+		{name: "> onto a directory", op: ">", mode: 1, why: "the dispatch loop reports whatever writeOutput returns, so a refused write has to come back as an error"},
+		{name: ">> onto a directory", op: ">>", mode: 3, why: "the dispatch loop reports whatever writeOutput returns, so a refused write has to come back as an error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			call := cmdLine([]string{"echo", "hello", tt.op, filepath.Base(dir)})
+
+			mustErr(t, call, writeOutput(dir, "hello", tt.mode), tt.why)
+		})
+	}
+}
+
+func TestWriteError_Valid(t *testing.T) {
+	tests := []struct {
+		name   string
+		op     string
+		mode   int
+		seeded bool
+		seed   string
+		want   string
+		why    string
+	}{
+		{
+			name: "2> writes the error message followed by a newline",
+			op:   "2>", mode: 2, want: "cd: missing operand\n",
+			why:  "spec: 2 is the file descriptor for standard error, so 2> sends the error message to the file",
+		},
+		{
+			name: "2> replaces what the file already held",
+			op:   "2>", mode: 2, seeded: true, seed: "old contents\n", want: "cd: missing operand\n",
+			why:  "spec: a truncating redirect overwrites the file, replacing its old contents",
+		},
+		{
+			name: "2>> adds to the end of an existing file",
+			op:   "2>>", mode: 4, seeded: true, seed: "first\n", want: "first\ncd: missing operand\n",
+			why:  "spec: 2>> adds to the end of the file rather than replacing it; the append branch still has to report the error it was handed rather than one of its own locals",
+		},
+		{
+			name: "2>> creates the file when it does not exist",
+			op:   "2>>", mode: 4, want: "cd: missing operand\n",
+			why:  "spec: 2>> creates the file if it does not exist; the append branch still has to report the error it was handed rather than one of its own locals",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "target.txt")
+			if tt.seeded {
+				if err := os.WriteFile(target, []byte(tt.seed), 0644); err != nil {
+					t.Fatalf("setup: cannot seed %q: %v", target, err)
+				}
+			}
+
+			reported := fmt.Errorf("cd: missing operand")
+			call := cmdLine([]string{"cd", tt.op, filepath.Base(target)})
+			mustNoErr(t, call, writeError(target, reported, tt.mode), tt.why)
+
+			data, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("setup: cannot read back %q: %v", target, err)
+			}
+			wantEqual(t, call, string(data), tt.want, tt.why)
+		})
+	}
+}
+
+func TestWriteError_Edge(t *testing.T) {
+	t.Run("a nil error writes nothing", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "target.txt")
+		why := "there is no failure to record, so the redirect target is left alone"
+		call := cmdLine([]string{"pwd", "2>", filepath.Base(target)}) + " (command succeeded)"
+
+		mustNoErr(t, call, writeError(target, nil, 2), why)
+
+		got := "no file"
+		if _, err := os.Stat(target); err == nil {
+			got = "file created"
+		}
+		wantEqual(t, call, got, "no file", why)
+	})
+}
+
+func TestWriteError_MustFail(t *testing.T) {
+	tests := []struct {
+		name string
+		op   string
+		mode int
+		why  string
+	}{
+		{name: "2> onto a directory", op: "2>", mode: 2, why: "the dispatch loop reports whatever writeError returns, so a refused write has to come back as an error"},
+		{name: "2>> onto a directory", op: "2>>", mode: 4, why: "the dispatch loop reports whatever writeError returns, so a refused write has to come back as an error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			call := cmdLine([]string{"cd", tt.op, filepath.Base(dir)})
+
+			mustErr(t, call, writeError(dir, fmt.Errorf("cd: missing operand"), tt.mode), tt.why)
+		})
+	}
+}
