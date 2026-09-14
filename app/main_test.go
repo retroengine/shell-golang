@@ -2982,3 +2982,126 @@ func TestHandleJobs_ReapsMultipleCompletedJobs(t *testing.T) {
 	w.Close() // let job1 (blocked reading stdin) see EOF and exit
 	<-jobsList[0].exited
 }
+
+// ============================================================
+// nextJobNumber
+// ============================================================
+
+func TestNextJobNumber_Valid(t *testing.T) {
+	origJobsList := jobsList
+	defer func() { jobsList = origJobsList }()
+
+	tests := []struct {
+		name     string
+		jobsList []*Job
+		want     int
+		why      string
+	}{
+		{
+			name:     "empty table starts at 1",
+			jobsList: nil,
+			want:     1,
+			why:      "spec: 'If the job table is empty, assign [1]'",
+		},
+		{
+			name:     "one more than the highest number present",
+			jobsList: []*Job{{Number: 1}, {Number: 2}},
+			want:     3,
+			why:      "spec: 'Otherwise, assign one more than the highest job number currently in the table'",
+		},
+		{
+			name:     "recycles the gap left by a removed higher-numbered job",
+			jobsList: []*Job{{Number: 1}},
+			want:     2,
+			why:      "spec worked example: 'Job 1 still running — next job gets [2]' — the next number is one more than job 1's, not a continuation of the old counter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobsList = tt.jobsList
+			got := nextJobNumber()
+			wantEqual(t, "nextJobNumber", fmt.Sprintf("%d", got), fmt.Sprintf("%d", tt.want), tt.why)
+		})
+	}
+}
+
+// ============================================================
+// reapCompletedJobs — automatic reaping before each prompt
+// ============================================================
+
+func TestReapCompletedJobs_Valid(t *testing.T) {
+	origJobsList := jobsList
+	jobsList = nil
+	defer func() { jobsList = origJobsList }()
+
+	origStdin := os.Stdin
+	r, w, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("setup: cannot create pipe: %v", perr)
+	}
+	os.Stdin = r
+	defer func() { os.Stdin = origStdin }()
+
+	why := "spec: 'Before printing the $ prompt... Display a Done line for each completed job... Remove those jobs from the job table' — automatic reaping shows only completed jobs, not the ones still Running"
+
+	stillRunning := buildBlockingScript(t) // job 1: stays Running until we close w below
+	_, err := handleExecFile([]string{stillRunning}, "", 0, true)
+	mustNoErr(t, cmdLine([]string{stillRunning})+" &", err, why)
+
+	completerPath := buildCompleterScript(t, "reap_prompt_marker", 0) // job 2: exits almost immediately
+	_, err = handleExecFile([]string{completerPath}, "", 0, true)
+	mustNoErr(t, cmdLine([]string{completerPath})+" &", err, why)
+
+	<-jobsList[1].exited // deterministically wait for job 2's reaper goroutine
+
+	rOut, wOut, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("setup: cannot create pipe: %v", perr)
+	}
+	origStdout := os.Stdout
+	os.Stdout = wOut
+
+	reapCompletedJobs()
+
+	wOut.Close()
+	os.Stdout = origStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, rOut)
+
+	want := "[2]+  " + "Done" + strings.Repeat(" ", 20) + completerPath + "\n"
+	wantEqual(t, "reapCompletedJobs", buf.String(), want, why)
+
+	gotJobs := handleJobs(nil)
+	wantJobs := "[1]+  " + "Running" + strings.Repeat(" ", 17) + stillRunning + " &"
+	wantEqual(t, "jobs after reap", gotJobs, wantJobs,
+		"spec: reaping removes the completed job from the table, promoting the survivor to +")
+
+	w.Close() // let job1 (blocked reading stdin) see EOF and exit
+	<-jobsList[0].exited
+}
+
+func TestReapCompletedJobs_Edge_NothingToReap(t *testing.T) {
+	origJobsList := jobsList
+	jobsList = nil
+	defer func() { jobsList = origJobsList }()
+
+	rOut, wOut, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("setup: cannot create pipe: %v", perr)
+	}
+	origStdout := os.Stdout
+	os.Stdout = wOut
+
+	reapCompletedJobs()
+
+	wOut.Close()
+	os.Stdout = origStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, rOut)
+
+	wantEqual(t, "reapCompletedJobs", buf.String(), "",
+		"spec: with no jobs (or nothing completed), reaping before the prompt prints nothing")
+}

@@ -2255,17 +2255,88 @@ func TestE2E_Jobs_ReapsMultipleCompletedJobs(t *testing.T) {
 		"'%s' > '%s/j1.txt' &\n'%s' > '%s/j2.txt' &\n'%s' > '%s/j3.txt' &\n'%s'\njobs\n'%s'\njobs\njobs\n",
 		job1, dir, job2, dir, job3, dir, delay1, delay2,
 	)
-	why := "spec: 'When jobs are removed, the markers shift' — job 1 starts with a space marker, is promoted to - once job 2 is reaped, then to + once job 3 is reaped too"
+	why := "spec: 'When jobs are removed, the markers shift' — job 1 starts with a space marker, is promoted to - once job 2 is reaped, then to + once job 3 is reaped too. " +
+		"Since a later stage made reaping automatic before every prompt, job 2's and job 3's Done lines now appear on their own, right after the preceding command's output and before jobs is even read — so each jobs call below only ever lists what's still Running."
 
 	got := runShell(t, binary, session)
 
-	afterFirstCheck := fmt.Sprintf("[1]   Running                 %s &\n[2]-  Done                    %s\n[3]+  Running                 %s &", job1, job2, job3)
-	afterSecondCheck := fmt.Sprintf("[1]-  Running                 %s &\n[3]+  Done                    %s", job1, job3)
+	doneJob2 := fmt.Sprintf("[2]-  Done                    %s", job2)
+	afterFirstJobsCall := fmt.Sprintf("[1]-  Running                 %s &\n[3]+  Running                 %s &", job1, job3)
+	doneJob3 := fmt.Sprintf("[3]+  Done                    %s", job3)
 	final := fmt.Sprintf("[1]+  Running                 %s &", job1)
 
-	assertContainsWhy(t, session, got, afterFirstCheck, why)
-	assertContainsWhy(t, session, got, afterSecondCheck, why)
+	assertContainsWhy(t, session, got, doneJob2, why)
+	assertContainsWhy(t, session, got, afterFirstJobsCall, why)
+	assertContainsWhy(t, session, got, doneJob3, why)
 	assertContainsWhy(t, session, got, final, why)
+}
+
+// ============================================================
+// jobs — automatic reaping before each prompt
+// ============================================================
+
+func TestE2E_Jobs_AutomaticReapingBeforePrompt(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	job1 := buildCompleterScript(t, "auto_reap_1", 5*time.Second)
+	job2 := buildCompleterScript(t, "auto_reap_2", 300*time.Millisecond)
+	delayCmd := buildCompleterScript(t, "cmd_output_marker", 600*time.Millisecond)
+
+	session := fmt.Sprintf("'%s' > '%s/j1.txt' &\n'%s' > '%s/j2.txt' &\n'%s'\njobs\n", job1, dir, job2, dir, delayCmd)
+	why := "spec: 'Before printing the $ prompt... Display a Done line for each completed job... This means completed jobs appear automatically without needing to run jobs. The Done entries appear between the command output and the next prompt' — and afterward 'the jobs builtin no longer shows job [2] (already reaped)'"
+
+	got := runShell(t, binary, session)
+
+	doneLine := fmt.Sprintf("[2]+  Done                    %s", job2)
+	runningLine := fmt.Sprintf("[1]+  Running                 %s &", job1)
+
+	assertContainsWhy(t, session, got, doneLine, why)
+	assertContainsWhy(t, session, got, runningLine, why)
+
+	idxCmdOutput := strings.Index(got, "cmd_output_marker")
+	idxDone := strings.Index(got, doneLine)
+	idxJobsListing := strings.Index(got, runningLine)
+	if idxCmdOutput == -1 || idxDone == -1 || idxJobsListing == -1 || !(idxCmdOutput < idxDone && idxDone < idxJobsListing) {
+		t.Error(failLine(typedSession(session), "the Done line appears after the command's own output and before the jobs listing",
+			fmt.Sprintf("cmd output at %d, Done line at %d, jobs listing at %d", idxCmdOutput, idxDone, idxJobsListing), why))
+	} else {
+		t.Logf("%s %s\n    expected: the Done line appears after the command's own output and before the jobs listing\n    received: correct order", markPass, typedSession(session))
+	}
+
+	count := strings.Count(got, doneLine)
+	if count != 1 {
+		t.Error(failLine(typedSession(session), "the Done line appears exactly once (shown automatically, not repeated by jobs)",
+			fmt.Sprintf("appeared %d times", count), why))
+	} else {
+		t.Logf("%s %s\n    expected: the Done line appears exactly once (shown automatically, not repeated by jobs)\n    received: appeared once", markPass, typedSession(session))
+	}
+}
+
+// ============================================================
+// jobs — recycles job numbers
+// ============================================================
+
+func TestE2E_Jobs_RecyclesJobNumber(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	job1 := buildCompleterScript(t, "recycle_e2e_1", 5*time.Second)
+	job2 := buildCompleterScript(t, "recycle_e2e_2", 300*time.Millisecond)
+	delayCmd := buildCompleterScript(t, "recycle_delay_marker", 600*time.Millisecond)
+	job3 := buildCompleterScript(t, "recycle_e2e_3", 5*time.Second)
+
+	session := fmt.Sprintf("'%s' > '%s/j1.txt' &\n'%s' > '%s/j2.txt' &\n'%s'\n'%s' > '%s/j3.txt' &\njobs\n",
+		job1, dir, job2, dir, delayCmd, job3, dir)
+	why := "spec: 'Otherwise, assign one more than the highest job number currently in the table' — after job 2 exits and is reaped, job 1 remains as [1]; the next job started must recycle number [2], not jump to [3]"
+
+	got := runShell(t, binary, session)
+
+	job1Line := fmt.Sprintf("[1]-  Running                 %s &", job1)
+	job3Line := fmt.Sprintf("[2]+  Running                 %s &", job3)
+
+	assertContainsWhy(t, session, got, job1Line, why)
+	assertContainsWhy(t, session, got, job3Line, why)
 }
 
 // ============================================================
