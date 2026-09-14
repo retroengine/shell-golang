@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"os"
 )
+var jobsCount int = 0
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
+
+	
 
 	builtInSet := map[string]string{ // keys are the recognised builtins; values are unused, only membership is checked (see handleTYPE)
 		"type": "get cmd type",
@@ -19,8 +22,11 @@ func main() {
 		"jobs":"to identify the bg task and more",
 	}
 
+
+
 	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
 	for {
+
 		fmt.Print("$ ")
 
 		args, InputErr := handleInput(reader)
@@ -47,6 +53,21 @@ func main() {
 				printLine(err.Error())
 			}
 			continue
+		}
+
+		jobArg := false
+
+		if args[len(args)-1] == "&" {
+			jobArg = true
+			args = args[:len(args)-1]
+		}
+
+		if len(args) == 0 {
+			continue
+		}
+
+		if jobArg {
+			jobsCount++
 		}
 
 		switch args[0] {
@@ -120,7 +141,7 @@ func main() {
 			}
 
 		default: // not a builtin: resolve and run as an external program
-			msg, err := handleExecFile(args, redirectTarget, mode)
+			msg, err := handleExecFile(args, redirectTarget, mode,jobArg)
 
 			if err != nil {
 				printLine(err.Error())

@@ -85,7 +85,7 @@ func handleTYPE(args []string, builtInSet map[string]string) (string, error) {
 }
 
 // handleExecFile runs an external program resolved from PATH, wiring stdin/stdout/stderr through (or to redirectTarget per mode).
-func handleExecFile(args []string, redirectTarget string, mode int) (string, error) {
+func handleExecFile(args []string, redirectTarget string, mode int,jobArg bool) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("no command provided")
 	}
@@ -129,6 +129,21 @@ func handleExecFile(args []string, redirectTarget string, mode int) (string, err
 		}
 	}
 
+	if jobArg {
+		err_cmd := cmd.Start()
+
+		if err_cmd != nil {
+			return "",err_cmd
+		}
+
+		pid := cmd.Process.Pid
+
+		printLine(fmt.Sprintf("[%d] %d",jobsCount,pid))
+
+		go cmd.Wait()
+
+		return "",nil
+	}
 	err_cmd := cmd.Run()
 
 	if err_cmd != nil {
