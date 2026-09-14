@@ -137,10 +137,23 @@ func handleExecFile(args []string, redirectTarget string, mode int,jobArg bool) 
 		}
 
 		pid := cmd.Process.Pid
+		number := nextJobNumber()
 
-		printLine(fmt.Sprintf("[%d] %d",jobsCount,pid))
+		job := &Job{
+			Number:  number,
+			PID:     pid,
+			Command: strings.Join(args, " "),
+			Status:  "Running",
+			exited:  make(chan struct{}),
+		}
+		jobsList = append(jobsList, job)
 
-		go cmd.Wait()
+		printLine(fmt.Sprintf("[%d] %d",number,pid))
+
+		go func() {
+			cmd.Wait()
+			close(job.exited)
+		}()
 
 		return "",nil
 	}
@@ -188,5 +201,87 @@ func handleComplete(args []string) string {
 
 	default:
 		return fmt.Sprintf("complete: %s: no completion specification", args[1])
+	}
+}
+
+// Job describes one background job tracked by the jobs builtin. exited is
+// closed by handleExecFile's reaper goroutine once cmd.Wait() returns, so
+// handleJobs can check completion without blocking (Go has no portable
+// waitpid(WNOHANG) equivalent that would also work on Windows).
+type Job struct {
+	Number  int
+	PID     int
+	Command string
+	Status  string
+	exited  chan struct{}
+}
+
+var jobsList []*Job
+
+// nextJobNumber returns the number to assign to a newly started background
+// job: 1 if the table is empty, otherwise one more than the highest number
+// currently in it. jobsList stays sorted ascending by Number (appended in
+// order, and reapAndFormat's removal preserves relative order), so that's
+// always its last element.
+func nextJobNumber() int {
+	if len(jobsList) == 0 {
+		return 1
+	}
+	return jobsList[len(jobsList)-1].Number + 1
+}
+
+// reapAndFormat is the shared reaping logic for both call sites (the jobs
+// builtin, and automatic pre-prompt reaping): it walks the table in order,
+// formats a Done line for anything that has exited (dropping it from
+// jobsList), and, when includeRunning is true, also formats a Running line
+// for everything still there — interleaved in job-number order either way,
+// since jobsList itself is always in that order.
+func reapAndFormat(includeRunning bool) []string {
+	lines := make([]string, 0, len(jobsList))
+	remaining := make([]*Job, 0, len(jobsList))
+
+	for i, job := range jobsList {
+		marker := " "
+		switch i {
+		case len(jobsList) - 1:
+			marker = "+"
+		case len(jobsList) - 2:
+			marker = "-"
+		}
+
+		exited := false
+		select {
+		case <-job.exited:
+			exited = true
+		default:
+		}
+
+		if exited {
+			lines = append(lines, fmt.Sprintf("[%d]%s  %-24s%s", job.Number, marker, "Done", job.Command))
+		} else {
+			remaining = append(remaining, job)
+			if includeRunning {
+				lines = append(lines, fmt.Sprintf("[%d]%s  %-24s%s", job.Number, marker, job.Status, job.Command+" &"))
+			}
+		}
+	}
+
+	jobsList = remaining
+	return lines
+}
+
+// handleJobs lists background jobs in the format "[N]<marker>  <status,
+// padded to 24 chars><command>", reaping (and reporting as Done) any job
+// that has exited since the last check.
+func handleJobs(args []string) string {
+	return strings.Join(reapAndFormat(true), "\n")
+}
+
+// reapCompletedJobs is called once per loop iteration, right before the
+// prompt is printed: it reaps and prints only what just finished, without
+// listing jobs that are still Running (unlike the jobs builtin).
+func reapCompletedJobs() {
+	for _, line := range reapAndFormat(false) {
+		printLine(line)
 	}
 }

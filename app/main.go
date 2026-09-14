@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 )
-var jobsCount int = 0
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
@@ -26,6 +25,8 @@ func main() {
 
 	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
 	for {
+
+		reapCompletedJobs() // before every prompt: show and drop any background job that finished since the last check
 
 		fmt.Print("$ ")
 
@@ -64,10 +65,6 @@ func main() {
 
 		if len(args) == 0 {
 			continue
-		}
-
-		if jobArg {
-			jobsCount++
 		}
 
 		switch args[0] {
@@ -138,6 +135,13 @@ func main() {
 
 			if strComplete != "" {
 				printLine(strComplete)
+			}
+
+		case "jobs":
+			jobsStr := handleJobs(args)
+
+			if jobsStr != "" {
+				printLine(jobsStr)
 			}
 
 		default: // not a builtin: resolve and run as an external program

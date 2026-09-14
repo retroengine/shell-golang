@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Tests are organised per function, and within each function into three
@@ -1526,7 +1529,7 @@ func TestHandleExecFile_Valid(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			call := cmdLine(tt.args)
-			msg, err := handleExecFile(tt.args, "", 0)
+			msg, err := handleExecFile(tt.args, "", 0, false)
 
 			mustNoErr(t, call, err, tt.why)
 			wantEqual(t, call, msg, "", "a successful run returns an empty message; the output went to stdout")
@@ -1564,7 +1567,7 @@ func TestHandleExecFile_MustFail(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			call := cmdLine(tt.args)
-			msg, err := handleExecFile(tt.args, "", 0)
+			msg, err := handleExecFile(tt.args, "", 0, false)
 
 			mustErr(t, call, err, tt.why)
 			wantEqual(t, call, msg, tt.wantMsg, tt.why)
@@ -2598,4 +2601,384 @@ func TestWriteError_MustFail(t *testing.T) {
 			mustErr(t, call, writeError(dir, fmt.Errorf("cd: missing operand"), tt.mode), tt.why)
 		})
 	}
+}
+
+// ============================================================
+// handleExecFile — background jobs (&)
+//
+// jobArg is the new 4th parameter. Per the spec's mechanism note
+// ("analogously in Go: cmd.Start() without cmd.Wait() blocking the
+// caller"), a background start must return without waiting for the
+// command to finish. buildCompleterScript is reused from e2e_test.go
+// (same package, no build tags separate the two files) as a portable,
+// cross-OS stand-in for a slow external command, so these tests don't
+// depend on unix `sleep`. Its own stdout is redirected to a file via the
+// same redirectTarget/mode plumbing handleExecFile already supports, so
+// os.Stdout is never shared with the test binary's own stdout.
+// ============================================================
+
+func TestHandleExecFile_Background_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "starting a background command succeeds and reports nothing back",
+			why:  "spec: the shell starts the program but doesn't wait for it to finish; a successful background start has nothing left to report through the return value — the job line itself is printed directly, not returned",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			completerPath := buildCompleterScript(t, "handleexecfile_bg_marker", 2*time.Second)
+			outFile := filepath.Join(t.TempDir(), "out.txt")
+			args := []string{completerPath}
+			call := cmdLine(args) + " &"
+
+			msg, err := handleExecFile(args, outFile, 1, true)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, "", tt.why)
+		})
+	}
+}
+
+func TestHandleExecFile_Background_DoesNotBlock(t *testing.T) {
+	completerPath := buildCompleterScript(t, "handleexecfile_bg_marker", 2*time.Second)
+	outFile := filepath.Join(t.TempDir(), "out.txt")
+	args := []string{completerPath}
+	call := cmdLine(args) + " &"
+	why := "spec: 'the shell starts the program but doesn't wait for it to finish' — mechanism note: 'cmd.Start() without cmd.Wait() blocking the caller' — handleExecFile must return long before the 2s command finishes"
+
+	start := time.Now()
+	_, err := handleExecFile(args, outFile, 1, true)
+	elapsed := time.Since(start)
+
+	mustNoErr(t, call, err, why)
+
+	const maxElapsed = 1 * time.Second
+	if elapsed >= maxElapsed {
+		t.Error(failLine(call, "return in well under "+maxElapsed.String()+" (non-blocking)", elapsed.String(), why))
+	} else {
+		t.Logf("%s %s\n    expected: return in well under %s (non-blocking)\n    received: %s", markPass, call, maxElapsed.String(), show(elapsed.String()))
+	}
+}
+
+func TestHandleExecFile_Background_MustFail(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantMsg string
+		why     string
+	}{
+		{
+			name:    "command is not on PATH, even when backgrounded",
+			args:    []string{"nosuchcmd12345"},
+			wantMsg: "nosuchcmd12345: command not found",
+			why:     "spec: the shell starts the program — with nothing on PATH to start, backgrounding it (&) must fail the same way a foreground run does (LookPath is checked before the background branch runs), not print a job line for a process that never started",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args) + " &"
+			msg, err := handleExecFile(tt.args, "", 0, true)
+
+			mustErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, tt.wantMsg, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handleExecFile — background jobs inherit the shell's stdout/stderr
+//
+// Swapping the package-level os.Stdout/os.Stderr for a pipe before
+// calling handleExecFile works because cmd.Stdout/cmd.Stderr are read
+// from those globals at call time (builtins.go:104-106); the background
+// child inherits a dup of the pipe's write end, so closing our own copy
+// right after handleExecFile returns and then draining the read end
+// blocks exactly until the child also exits and closes its copy — no
+// manual sleep or poll needed.
+// ============================================================
+
+func TestHandleExecFile_Background_StdoutInherited(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "background job's stdout is inherited from the shell, not silently dropped",
+			why:  "spec: 'the background process's stdout and stderr streams remain connected to the shell's terminal... any output it produces should still appear in your shell'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			completerPath := buildCompleterScript(t, "unit_bg_stdout_marker", 200*time.Millisecond)
+			args := []string{completerPath}
+			call := cmdLine(args) + " &"
+
+			r, w, perr := os.Pipe()
+			if perr != nil {
+				t.Fatalf("setup: cannot create pipe: %v", perr)
+			}
+			origStdout := os.Stdout
+			os.Stdout = w
+			defer func() { os.Stdout = origStdout }()
+
+			_, err := handleExecFile(args, "", 0, true)
+			w.Close()
+			os.Stdout = origStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+
+			mustNoErr(t, call, err, tt.why)
+			wantContains(t, call, buf.String(), "unit_bg_stdout_marker", tt.why)
+		})
+	}
+}
+
+func TestHandleExecFile_Background_StderrInherited(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "background job's stderr is inherited from the shell, not silently dropped",
+			why:  "spec: 'you must ensure the background process shares the same stdout and stderr as the shell' — stderr is named explicitly alongside stdout",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stderrScript := buildStderrScript(t, "unit_bg_stderr_marker", 200*time.Millisecond)
+			args := []string{stderrScript}
+			call := cmdLine(args) + " &"
+
+			r, w, perr := os.Pipe()
+			if perr != nil {
+				t.Fatalf("setup: cannot create pipe: %v", perr)
+			}
+			origStderr := os.Stderr
+			os.Stderr = w
+			defer func() { os.Stderr = origStderr }()
+
+			_, err := handleExecFile(args, "", 0, true)
+			w.Close()
+			os.Stderr = origStderr
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+
+			mustNoErr(t, call, err, tt.why)
+			wantContains(t, call, buf.String(), "unit_bg_stderr_marker", tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handleJobs
+// ============================================================
+
+func TestHandleJobs_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "a single running job is listed as [N]+  Running  <padding>  <command> &",
+			why:  "spec: 'The jobs builtin lists background jobs in this format: [1]+  Running                 sleep 10 &' — job number in brackets, + marker, two spaces, status padded to 24 characters total, then the command",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origJobsList := jobsList
+			jobsList = nil
+			defer func() {
+				jobsList = origJobsList
+			}()
+
+			completerPath := buildCompleterScript(t, "handlejobs_valid_marker", 5*time.Second)
+			args := []string{completerPath}
+			call := cmdLine(args) + " &"
+			_, err := handleExecFile(args, "", 0, true)
+			mustNoErr(t, call, err, tt.why)
+
+			want := "[1]+  " + "Running" + strings.Repeat(" ", 17) + completerPath + " &"
+			got := handleJobs(nil)
+
+			wantEqual(t, "jobs", got, want, tt.why)
+		})
+	}
+}
+
+func TestHandleJobs_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "no jobs running yet",
+			why:  "spec: the jobs builtin lists background jobs — with none started, there is nothing to list",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origJobsList := jobsList
+			jobsList = nil
+			defer func() { jobsList = origJobsList }()
+
+			wantEqual(t, "jobs", handleJobs(nil), "", tt.why)
+		})
+	}
+}
+
+func TestHandleJobs_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "nil args", args: nil},
+		{name: "empty args", args: []string{}},
+		{name: "extra args jobs does not use", args: []string{"jobs", "-l", "%1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			// handleJobs has no error return; this just proves it returns
+			// cleanly (no panic) regardless of args content.
+			_ = handleJobs(tt.args)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
+		})
+	}
+}
+
+func TestHandleJobs_MultipleJobs_Valid(t *testing.T) {
+	origJobsList := jobsList
+	jobsList = nil
+	defer func() {
+		jobsList = origJobsList
+	}()
+
+	job1 := buildCompleterScript(t, "handlejobs_multi_marker1", 5*time.Second)
+	job2 := buildCompleterScript(t, "handlejobs_multi_marker2", 5*time.Second)
+	job3 := buildCompleterScript(t, "handlejobs_multi_marker3", 5*time.Second)
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+		why  string
+	}{
+		{
+			name: "after the first job starts, it is the current job and gets +",
+			args: []string{job1},
+			want: "[1]+  " + "Running" + strings.Repeat(" ", 17) + job1 + " &",
+			why:  "spec: '+ - The most recently started job (the \"current\" job)' — with a single job, it is both current and only",
+		},
+		{
+			name: "after a second job starts, it becomes current (+) and the first becomes previous (-)",
+			args: []string{job2},
+			want: "[1]-  " + "Running" + strings.Repeat(" ", 17) + job1 + " &" + "\n" +
+				"[2]+  " + "Running" + strings.Repeat(" ", 17) + job2 + " &",
+			why: "spec: '- - The second most recently started job (the \"previous\" job)' — starting job 2 demotes job 1 from current to previous",
+		},
+		{
+			name: "after a third job starts, the oldest job is neither current nor previous and gets a space",
+			args: []string{job3},
+			want: "[1]   " + "Running" + strings.Repeat(" ", 17) + job1 + " &" + "\n" +
+				"[2]-  " + "Running" + strings.Repeat(" ", 17) + job2 + " &" + "\n" +
+				"[3]+  " + "Running" + strings.Repeat(" ", 17) + job3 + " &",
+			why: "spec: 'Space ( ) - All other jobs' — with three jobs, job 1 is neither the current nor the previous job",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args) + " &"
+			_, err := handleExecFile(tt.args, "", 0, true)
+			mustNoErr(t, call, err, tt.why)
+
+			got := handleJobs(nil)
+			wantEqual(t, "jobs", got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleJobs_ReapsCompletedJob(t *testing.T) {
+	origJobsList := jobsList
+	jobsList = nil
+	defer func() {
+		jobsList = origJobsList
+	}()
+
+	completerPath := buildCompleterScript(t, "reaps_single_marker", 0)
+	args := []string{completerPath}
+	call := cmdLine(args) + " &"
+	why := "spec: 'If a job has exited, display it with status Done in the current output' and 'Remove the Done job from the job table so it doesn't appear in subsequent jobs calls' — Done entries also have no trailing &, unlike Running entries"
+
+	_, err := handleExecFile(args, "", 0, true)
+	mustNoErr(t, call, err, why)
+
+	<-jobsList[0].exited // deterministically wait for the reaper goroutine to observe the exit
+
+	wantDone := "[1]+  " + "Done" + strings.Repeat(" ", 20) + completerPath
+	gotDone := handleJobs(nil)
+	wantEqual(t, "jobs", gotDone, wantDone, why)
+
+	gotSecondCall := handleJobs(nil)
+	wantEqual(t, "jobs (second call)", gotSecondCall, "", "spec: 'The next jobs call shows nothing (job was removed)'")
+}
+
+func TestHandleJobs_ReapsMultipleCompletedJobs(t *testing.T) {
+	origJobsList := jobsList
+	jobsList = nil
+	defer func() {
+		jobsList = origJobsList
+	}()
+
+	origStdin := os.Stdin
+	r, w, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("setup: cannot create pipe: %v", perr)
+	}
+	os.Stdin = r
+	defer func() { os.Stdin = origStdin }()
+
+	why := "spec: 'Loop through your background jobs and check each one to see if it has exited' and 'The + and - markers should be recalculated after removing completed jobs'"
+
+	job1 := buildBlockingScript(t) // stays Running until we close w below
+	job2 := buildCompleterScript(t, "reaps_multi_marker2", 0)
+	job3 := buildCompleterScript(t, "reaps_multi_marker3", 0)
+
+	_, err := handleExecFile([]string{job1}, "", 0, true)
+	mustNoErr(t, cmdLine([]string{job1})+" &", err, why)
+
+	_, err = handleExecFile([]string{job2}, "", 0, true)
+	mustNoErr(t, cmdLine([]string{job2})+" &", err, why)
+
+	_, err = handleExecFile([]string{job3}, "", 0, true)
+	mustNoErr(t, cmdLine([]string{job3})+" &", err, why)
+
+	<-jobsList[1].exited // job2
+	<-jobsList[2].exited // job3
+
+	wantFirst := "[1]   " + "Running" + strings.Repeat(" ", 17) + job1 + " &" + "\n" +
+		"[2]-  " + "Done" + strings.Repeat(" ", 20) + job2 + "\n" +
+		"[3]+  " + "Done" + strings.Repeat(" ", 20) + job3
+	gotFirst := handleJobs(nil)
+	wantEqual(t, "jobs", gotFirst, wantFirst, why)
+
+	wantSecond := "[1]+  " + "Running" + strings.Repeat(" ", 17) + job1 + " &"
+	gotSecond := handleJobs(nil)
+	wantEqual(t, "jobs (second call)", gotSecond, wantSecond,
+		"spec: 'Job 1 started with no marker (space), but after jobs 2 and 3 are removed, it's the only remaining job and gets promoted to +'")
+
+	w.Close() // let job1 (blocked reading stdin) see EOF and exit
+	<-jobsList[0].exited
 }

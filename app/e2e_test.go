@@ -1336,6 +1336,45 @@ func main() {
 	return filepath.ToSlash(binPath)
 }
 
+// buildBlockingScript compiles a tiny standalone program that blocks
+// reading from stdin until it hits EOF, then exits. Used (from
+// main_test.go) as a background job that reliably stays "Running" for as
+// long as a test needs it to, without an arbitrary sleep duration, and
+// terminates cleanly once the test explicitly closes its stdin — avoiding
+// a lingering process that could still hold its own binary file open when
+// t.TempDir() tries to clean it up.
+func buildBlockingScript(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"io"
+	"os"
+)
+
+func main() {
+	io.Copy(io.Discard, os.Stdin)
+}
+`
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write blocking script source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "blocker")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build blocking script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
 // ============================================================
 // running the completer script
 // ============================================================
@@ -1917,6 +1956,316 @@ func TestE2E_CompleteDashR_TabNoLongerCompletes(t *testing.T) {
 	} else {
 		t.Logf("%s %s\n    expected: no completion from the removed script\n    received: %s", markPass, typedSession(session), show(got))
 	}
+}
+
+// ============================================================
+// background jobs (&)
+//
+// The tester-verified behaviours from the spec: (1) the job line
+// "[JOB_NUMBER] PID" appears on its own line, (2) the shell doesn't wait
+// for the command and keeps reading input, (3) the background process
+// actually starts running. Every background command's own stdout is
+// redirected to a file with the shell's existing `>` feature: runShell
+// captures the shell process's stdout into a bytes.Buffer, and Go's exec
+// internals won't consider that pipe closed until every process holding
+// the fd — including a still-running background grandchild — exits, so
+// an un-redirected background job would make runShell itself block.
+// ============================================================
+
+func TestE2E_BackgroundJob_PrintsJobLine(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	sleeperPath := buildCompleterScript(t, "bg_done_marker", 0)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "prints [job_number] pid on its own line",
+			session: fmt.Sprintf("'%s' > '%s/job_line.txt' &\n", sleeperPath, dir),
+			want:    "[1] ",
+			why:     "spec: 'When a background job starts, the shell prints a line showing its job number and process ID: $ sleep 30 & / [1] 84470' — 'in this stage only one background job will be started, so the job number is always [1]'",
+		},
+		{
+			name:    "keeps reading and runs the next command after starting a background job",
+			session: fmt.Sprintf("'%s' > '%s/keeps_reading.txt' &\necho after_bg_marker\n", sleeperPath, dir),
+			want:    "after_bg_marker",
+			why:     "spec: 'show the next prompt immediately' — the shell must resume reading and running subsequent commands right after starting a background job, not stall on it",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestE2E_BackgroundJob_DoesNotBlockShell(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	delay := 2 * time.Second
+	sleeperPath := buildCompleterScript(t, "bg_slow_marker", delay)
+	outFile := dir + "/bg_slow_out.txt"
+	session := fmt.Sprintf("'%s' > '%s' &\n", sleeperPath, outFile)
+	why := "spec: 'The shell starts the program but doesn't wait for it to finish, allowing you to continue typing other commands' — tester check (2): 'the next prompt appears immediately (the shell doesn't wait for the command to finish)'"
+
+	start := time.Now()
+	runShell(t, binary, session)
+	elapsed := time.Since(start)
+
+	const maxElapsed = 1 * time.Second
+	if elapsed >= maxElapsed {
+		t.Error(failLine(typedSession(session), "shell returns in well under "+maxElapsed.String(), elapsed.String(), why))
+	} else {
+		t.Logf("%s %s\n    expected: shell returns in well under %s\n    received: %s", markPass, typedSession(session), maxElapsed.String(), show(elapsed.String()))
+	}
+}
+
+func TestE2E_BackgroundJob_ActuallyRuns(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	delay := 2 * time.Second
+	sleeperPath := buildCompleterScript(t, "bg_ran_marker", delay)
+	outFile := dir + "/bg_ran_out.txt"
+	session := fmt.Sprintf("'%s' > '%s' &\n", sleeperPath, outFile)
+	why := "spec: tester check (3): 'the background process actually starts running' — its delayed stdout must eventually land in the file it was redirected to, even though the shell (and this runShell call) already returned"
+
+	runShell(t, binary, session)
+
+	const pollFor = 4 * time.Second // delay (2s) plus margin: the grandchild may finish slightly after the shell process itself exits
+	const pollEvery = 100 * time.Millisecond
+	outFileNative := filepath.FromSlash(outFile)
+
+	deadline := time.Now().Add(pollFor)
+	var got string
+	for {
+		if data, err := os.ReadFile(outFileNative); err == nil {
+			got = string(data)
+			if strings.Contains(got, "bg_ran_marker") {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(pollEvery)
+	}
+
+	wantContains(t, typedSession(session), got, "bg_ran_marker", why)
+}
+
+// ============================================================
+// background job output — shares the shell's stdout/stderr
+//
+// Unlike TestE2E_BackgroundJob_* above, these deliberately do NOT
+// redirect the background job's own stdout/stderr to a file: the point
+// here is to prove that with no redirect, its output still reaches the
+// same terminal stream the shell itself writes to. runShell blocking
+// until the child's inherited stdout/stderr pipe closes (the same
+// mechanism flagged as a gotcha in the section above) is exactly what
+// lets these tests observe the content — the delay is kept short (200ms)
+// since nothing here is racing a deadline.
+// ============================================================
+
+// buildStderrScript compiles a tiny standalone program that sleeps for
+// delay (if non-zero) and then prints output as its single line of
+// stderr — a stderr-writing sibling of buildCompleterScript. Returns its
+// path, slash-normalised for embedding in a session string.
+func buildStderrScript(t *testing.T, output string, delay time.Duration) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := fmt.Sprintf(`package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+)
+
+func main() {
+	time.Sleep(%d * time.Millisecond)
+	fmt.Fprintln(os.Stderr, %q)
+}
+`, delay.Milliseconds(), output)
+
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write stderr script source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "stderr_script")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build stderr script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// runShellCapturingStderr behaves like runShell, but captures the shell
+// process's own stderr into a separate buffer instead of discarding it
+// (runShell sets cmd.Stderr = nil to hide the shell's EOF-panic trace).
+// A background job's stderr is inherited from the shell's own os.Stderr
+// (builtins.go:106), so runShell's discarded stderr can never observe it —
+// this dedicated variant exists solely to make that claim testable,
+// without changing runShell's behavior for every other E2E test.
+func runShellCapturingStderr(t *testing.T, binary, session string) (stdout, stderr string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binary)
+	cmd.Stdin = strings.NewReader(session)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	cmd.Run()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("shell did not exit within 5s\n  session: %q\n  stdout so far: %q\n  stderr so far: %q", session, outBuf.String(), errBuf.String())
+	}
+	return outBuf.String(), errBuf.String()
+}
+
+func TestE2E_BackgroundJob_StdoutAppearsInTerminal(t *testing.T) {
+	binary := buildTestBinary(t)
+	session := fmt.Sprintf("'%s' &\n", buildCompleterScript(t, "bg_stdout_marker", 200*time.Millisecond))
+	why := "spec: 'the background process's stdout and stderr streams remain connected to the shell's terminal... any output it produces should still appear in your shell' — with no redirect on the command, its stdout must reach the same terminal the shell itself writes to, not be silently dropped"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, "bg_stdout_marker", why)
+}
+
+func TestE2E_BackgroundJob_StderrAppearsInTerminal(t *testing.T) {
+	binary := buildTestBinary(t)
+	session := fmt.Sprintf("'%s' &\n", buildStderrScript(t, "bg_stderr_marker", 200*time.Millisecond))
+	why := "spec: 'you must ensure the background process shares the same stdout and stderr as the shell' — stderr is named explicitly alongside stdout, so a background job's error output must also reach the terminal"
+
+	_, gotStderr := runShellCapturingStderr(t, binary, session)
+	wantContains(t, typedSession(session), gotStderr, "bg_stderr_marker", why)
+}
+
+func TestE2E_BackgroundJob_ForegroundStillWorksAfterBackgroundJob(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	sleeperPath := buildCompleterScript(t, "bg_marker", 200*time.Millisecond)
+	session := fmt.Sprintf("'%s' &\necho foreground_marker\n", sleeperPath)
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "bg_marker",
+		"spec: the background job's own output still appears in the terminal")
+	assertContainsWhy(t, session, got, "foreground_marker",
+		"spec: 'I can type this immediately' — a foreground command started right after a background job runs normally and its own output still appears, sharing the same terminal without interference")
+}
+
+// ============================================================
+// jobs — lists a single running background job
+// ============================================================
+
+func TestE2E_Jobs_ListsSingleRunningJob(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	sleeperPath := buildCompleterScript(t, "jobs_marker", 200*time.Millisecond)
+	session := fmt.Sprintf("'%s' &\njobs\n", sleeperPath)
+	why := "spec: 'The jobs builtin lists background jobs in this format: [1]+  Running                 sleep 10 &' — tester checks: job number [1], marker +, status Running, command matching what was run"
+
+	got := runShell(t, binary, session)
+	want := fmt.Sprintf("[1]+  Running                 %s &", sleeperPath)
+
+	assertContainsWhy(t, session, got, want, why)
+}
+
+func TestE2E_Jobs_ListsMultipleRunningJobs(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	job1 := buildCompleterScript(t, "e2e_job1", 0)
+	job2 := buildCompleterScript(t, "e2e_job2", 0)
+	job3 := buildCompleterScript(t, "e2e_job3", 0)
+
+	session := fmt.Sprintf("'%s' &\njobs\n'%s' &\njobs\n'%s' &\njobs\n", job1, job2, job3)
+	why := "spec: 'When multiple commands run in the background, the jobs command lists them in the order they were started' — the current job (+) moves to the newest, the previous current job becomes previous (-), and older jobs get a blank marker"
+
+	got := runShell(t, binary, session)
+
+	afterFirst := fmt.Sprintf("[1]+  Running                 %s &", job1)
+	afterSecond := fmt.Sprintf("[1]-  Running                 %s &\n[2]+  Running                 %s &", job1, job2)
+	afterThird := fmt.Sprintf("[1]   Running                 %s &\n[2]-  Running                 %s &\n[3]+  Running                 %s &", job1, job2, job3)
+
+	assertContainsWhy(t, session, got, afterFirst, why)
+	assertContainsWhy(t, session, got, afterSecond, why)
+	assertContainsWhy(t, session, got, afterThird, why)
+}
+
+// ============================================================
+// jobs — reaps completed background jobs
+// ============================================================
+
+func TestE2E_Jobs_ReapsCompletedJob(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	bgJob := buildCompleterScript(t, "reap_e2e_marker", 300*time.Millisecond)
+	delay := buildCompleterScript(t, "delay_marker", 700*time.Millisecond)
+
+	session := fmt.Sprintf("'%s' > '%s/bg.txt' &\njobs\n'%s'\njobs\njobs\n", bgJob, dir, delay)
+	why := "spec: the first jobs call shows the job Running with a trailing &; once it exits, the next jobs call shows it once as Done without the trailing &; the call after that shows nothing (it was removed)"
+
+	got := runShell(t, binary, session)
+
+	runningLine := fmt.Sprintf("[1]+  Running                 %s &", bgJob)
+	doneLine := fmt.Sprintf("[1]+  Done                    %s", bgJob)
+
+	assertContainsWhy(t, session, got, runningLine, why)
+	assertContainsWhy(t, session, got, doneLine, why)
+
+	count := strings.Count(got, doneLine)
+	if count != 1 {
+		t.Error(failLine(typedSession(session), "the Done line appears exactly once (then the job is removed)",
+			fmt.Sprintf("appeared %d times", count), why))
+	} else {
+		t.Logf("%s %s\n    expected: the Done line appears exactly once (then the job is removed)\n    received: appeared once", markPass, typedSession(session))
+	}
+}
+
+func TestE2E_Jobs_ReapsMultipleCompletedJobs(t *testing.T) {
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+
+	job1 := buildCompleterScript(t, "multi_reap_1", 5*time.Second)
+	job2 := buildCompleterScript(t, "multi_reap_2", 300*time.Millisecond)
+	job3 := buildCompleterScript(t, "multi_reap_3", 1200*time.Millisecond)
+	delay1 := buildCompleterScript(t, "delay1_marker", 700*time.Millisecond)
+	delay2 := buildCompleterScript(t, "delay2_marker", 900*time.Millisecond)
+
+	session := fmt.Sprintf(
+		"'%s' > '%s/j1.txt' &\n'%s' > '%s/j2.txt' &\n'%s' > '%s/j3.txt' &\n'%s'\njobs\n'%s'\njobs\njobs\n",
+		job1, dir, job2, dir, job3, dir, delay1, delay2,
+	)
+	why := "spec: 'When jobs are removed, the markers shift' — job 1 starts with a space marker, is promoted to - once job 2 is reaped, then to + once job 3 is reaped too"
+
+	got := runShell(t, binary, session)
+
+	afterFirstCheck := fmt.Sprintf("[1]   Running                 %s &\n[2]-  Done                    %s\n[3]+  Running                 %s &", job1, job2, job3)
+	afterSecondCheck := fmt.Sprintf("[1]-  Running                 %s &\n[3]+  Done                    %s", job1, job3)
+	final := fmt.Sprintf("[1]+  Running                 %s &", job1)
+
+	assertContainsWhy(t, session, got, afterFirstCheck, why)
+	assertContainsWhy(t, session, got, afterSecondCheck, why)
+	assertContainsWhy(t, session, got, final, why)
 }
 
 // ============================================================
