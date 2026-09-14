@@ -16,6 +16,7 @@ func main() {
 		"pwd":  "get working directory",
 		"cd":   "change directory",
 		"complete": "registers autocompletion for given word",
+		"jobs":"to identify the bg task and more",
 	}
 
 	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
