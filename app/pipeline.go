@@ -6,41 +6,56 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 )
 
-// splitPipeline scans args for a single "|" token and splits it into the two
-// command segments on either side. isPipeline is false (with left/right nil,
-// err nil) when args contains no "|" at all, so callers can fall through to
-// their normal non-pipeline handling. This stage only supports a pipeline of
-// exactly two commands, so a leading/trailing "|" (an empty side) or more
-// than one "|" is reported as a syntax error instead of silently guessed at.
-func splitPipeline(args []string) (left, right []string, isPipeline bool, err error) {
-	idx := -1
-	count := 0
-	for i, a := range args {
-		if a == "|" {
-			count++
-			if idx == -1 {
-				idx = i
-			}
+// splitPipelineStages scans args for "|" tokens and splits it into two or
+// more command segments, one per pipeline stage. isPipeline is false (with
+// stages nil, err nil) when args contains no "|" at all, so callers can fall
+// through to their normal non-pipeline handling. A leading/trailing "|" or
+// two "|" back to back (an empty stage) is reported as a syntax error
+// instead of silently guessed at; any other number of "|" tokens, with a
+// non-empty segment on every side, is a valid pipeline of that many stages.
+func splitPipelineStages(args []string) (stages [][]string, isPipeline bool, err error) {
+	var current []string
+	for _, a := range args {
+		if a != "|" {
+			current = append(current, a)
+			continue
 		}
+		if len(current) == 0 {
+			return nil, true, fmt.Errorf("syntax error near unexpected token `|'")
+		}
+		stages = append(stages, current)
+		current = nil
 	}
 
-	if count == 0 {
+	if len(stages) == 0 { // no "|" seen at all
+		return nil, false, nil
+	}
+	if len(current) == 0 {
+		return nil, true, fmt.Errorf("syntax error near unexpected token `|'")
+	}
+	stages = append(stages, current)
+	return stages, true, nil
+}
+
+// splitPipeline is the two-stage form of splitPipelineStages, kept for its
+// existing callers/tests. A pipeline of anything other than exactly two
+// stages is reported the same way it always has been: as a syntax error,
+// not silently truncated or expanded.
+func splitPipeline(args []string) (left, right []string, isPipeline bool, err error) {
+	stages, isPipeline, err := splitPipelineStages(args)
+	if !isPipeline {
 		return nil, nil, false, nil
 	}
-	if count > 1 {
+	if err != nil {
+		return nil, nil, true, err
+	}
+	if len(stages) != 2 {
 		return nil, nil, true, fmt.Errorf("syntax error: only a single pipe between two commands is supported")
 	}
-
-	left = args[:idx]
-	right = args[idx+1:]
-
-	if len(left) == 0 || len(right) == 0 {
-		return nil, nil, true, fmt.Errorf("syntax error near unexpected token `|'")
-	}
-
-	return left, right, true, nil
+	return stages[0], stages[1], true, nil
 }
 
 // isBuiltin reports whether name is a recognised shell builtin, using the
@@ -51,13 +66,13 @@ func isBuiltin(name string) bool {
 }
 
 // captureBuiltin runs a builtin in-process (no fork/exec) and returns what
-// it would send to stdout, for when it is the producer half of a pipeline.
+// it would send to stdout, for when it is a producer stage of a pipeline.
 // hasOutput mirrors main's own per-builtin rule for whether an empty result
 // still counts as a line to emit: echo, pwd and type always print their
 // result even when empty; jobs and complete suppress an empty result; cd
 // never has stdout at all, only a possible error. "exit" is a no-op here —
-// see handlePipeline's doc comment for why a builtin mid-pipeline must not
-// tear down the shell loop.
+// see handlePipelineStages' doc comment for why a builtin mid-pipeline must
+// not tear down the shell loop.
 func captureBuiltin(args []string) (output string, hasOutput bool, err error) {
 	switch args[0] {
 	case "echo":
@@ -119,201 +134,182 @@ func printBuiltinInPipeline(args []string) error {
 			printLine(s)
 		}
 	case "exit":
-		// no-op: see handlePipeline's doc comment
+		// no-op: see handlePipelineStages' doc comment
 	}
 	return nil
 }
 
-// handlePipeline connects leftArgs to rightArgs, one of four ways depending
-// on which side(s) are shell builtins. Builtins in this shell are just Go
-// functions with no process of their own, so they run in-process rather
-// than through the OS pipe; external commands are unaffected, still
-// wired together exactly as before builtins were supported.
+// handlePipeline is the two-stage form of handlePipelineStages, kept for its
+// existing callers/tests.
+func handlePipeline(leftArgs, rightArgs []string) (string, error) {
+	return handlePipelineStages([][]string{leftArgs, rightArgs})
+}
+
+// pending describes what the stage after the one just processed must wire
+// its stdin to. The zero value (isFirst) means "the shell's own stdin",
+// which is only valid for stage 0.
+type pipelinePending struct {
+	pipeR         *os.File // read end of a still-open pipe from an external producer
+	builtinOut    string   // captured output from a builtin producer
+	hasBuiltinOut bool
+	fromBuiltin   bool
+	isFirst       bool
+}
+
+// handlePipelineStages connects an arbitrary chain of two or more pipeline
+// stages, in order. Builtins in this shell are just Go functions with no
+// process of their own, so they run in-process rather than through an OS
+// pipe; external commands are wired together via os.Pipe() and fork/exec,
+// exactly as a two-stage pipeline always has been.
 //
-// A builtin that is not the pipeline's final stage never sees the other
-// side's data: none of this shell's builtins read stdin, so a builtin
-// producer's output has nowhere to be consumed, and an external producer
-// feeding a builtin consumer is simply drained and discarded. Both are the
-// correct stand-in for "piping into something that ignores its input" —
-// matching the spec's "ls | type exit" example, where ls's listing must not
-// reach the terminal. "exit" partway through a pipeline is treated as a
-// no-op rather than ending the shellLoop in main: in real shells each
+// A builtin that is not the pipeline's final stage never sees the previous
+// stage's data: none of this shell's builtins read stdin, so a builtin
+// producer's output has nowhere to be consumed by the builtin that follows
+// it, and an external producer feeding a builtin consumer is simply drained
+// and discarded. Both are the correct stand-in for "piping into something
+// that ignores its input". "exit" partway through a pipeline is treated as
+// a no-op rather than ending the shellLoop in main: in real shells each
 // non-final pipeline stage runs in a subshell, so "exit" there never kills
 // the interactive shell either.
-func handlePipeline(leftArgs, rightArgs []string) (string, error) {
-	leftBuiltin := isBuiltin(leftArgs[0])
-	rightBuiltin := isBuiltin(rightArgs[0])
-
-	switch {
-	case leftBuiltin && rightBuiltin:
-		return pipelineBuiltinToBuiltin(leftArgs, rightArgs)
-	case leftBuiltin:
-		return pipelineBuiltinToExternal(leftArgs, rightArgs)
-	case rightBuiltin:
-		return pipelineExternalToBuiltin(leftArgs, rightArgs)
-	default:
-		return pipelineExternalToExternal(leftArgs, rightArgs)
-	}
-}
-
-// pipelineBuiltinToBuiltin runs both sides in-process; see handlePipeline's
-// doc comment for why the left side's output is discarded rather than fed
-// to the right side.
-func pipelineBuiltinToBuiltin(leftArgs, rightArgs []string) (string, error) {
-	if _, _, err := captureBuiltin(leftArgs); err != nil {
-		printLine(err.Error())
-	}
-	return "", printBuiltinInPipeline(rightArgs)
-}
-
-// pipelineBuiltinToExternal runs leftArgs in-process and feeds whatever it
-// would have printed into rightArgs, an external command, through an OS
-// pipe — the same wiring pipelineExternalToExternal gives two external
-// commands, just with the write side driven by a Go string instead of a
-// child process.
-func pipelineBuiltinToExternal(leftArgs, rightArgs []string) (string, error) {
-	if _, err := exec.LookPath(rightArgs[0]); errors.Is(err, exec.ErrNotFound) {
-		return fmt.Sprintf("%s: command not found", rightArgs[0]), err
-	} else if err != nil {
-		return "Error while visiting file", err
+//
+// Every external stage's command name is checked against PATH before any
+// stage runs, so an unresolvable name later in the chain is reported
+// without any builtin earlier in the chain (e.g. a producer "cd") having
+// already taken effect — the same "validate both sides before starting
+// either" rule a two-stage pipeline has always applied, extended to however
+// many stages there are.
+func handlePipelineStages(stages [][]string) (string, error) {
+	for _, stage := range stages {
+		if isBuiltin(stage[0]) {
+			continue
+		}
+		if _, err := exec.LookPath(stage[0]); errors.Is(err, exec.ErrNotFound) {
+			return fmt.Sprintf("%s: command not found", stage[0]), err
+		} else if err != nil {
+			return "Error while visiting file", err
+		}
 	}
 
-	leftOutput, hasOutput, leftErr := captureBuiltin(leftArgs)
-	if leftErr != nil {
-		printLine(leftErr.Error())
-		hasOutput = false
+	var (
+		cmds    []*exec.Cmd // every non-final external command, started but not yet waited on
+		drainWG sync.WaitGroup
+	)
+	cleanup := func() {
+		for _, c := range cmds {
+			c.Wait() // ignored: only the pipeline's final stage can fail the pipeline
+		}
+		drainWG.Wait()
 	}
 
-	r, w, err := os.Pipe()
-	if err != nil {
-		return "", err
+	cur := pipelinePending{isFirst: true}
+	n := len(stages)
+
+	for i, stage := range stages {
+		isLast := i == n-1
+
+		if isBuiltin(stage[0]) {
+			switch {
+			case cur.isFirst, cur.fromBuiltin:
+				// nothing arriving through an OS pipe to dispose of
+			case cur.pipeR != nil:
+				r := cur.pipeR
+				drainWG.Add(1)
+				go func() {
+					defer drainWG.Done()
+					io.Copy(io.Discard, r)
+					r.Close()
+				}()
+			}
+
+			if isLast {
+				err := printBuiltinInPipeline(stage)
+				cleanup()
+				return "", err
+			}
+
+			out, hasOut, err := captureBuiltin(stage)
+			if err != nil {
+				printLine(err.Error())
+				hasOut = false
+			}
+			cur = pipelinePending{fromBuiltin: true, builtinOut: out, hasBuiltinOut: hasOut}
+			continue
+		}
+
+		cmd := exec.Command(stage[0], stage[1:]...)
+		cmd.Stderr = os.Stderr
+
+		var feedW *os.File
+		switch {
+		case cur.isFirst:
+			cmd.Stdin = os.Stdin
+		case cur.fromBuiltin:
+			r, w, err := os.Pipe()
+			if err != nil {
+				cleanup()
+				return "", err
+			}
+			cmd.Stdin = r
+			feedW = w
+		default:
+			cmd.Stdin = cur.pipeR
+		}
+
+		var outR, outW *os.File
+		if isLast {
+			cmd.Stdout = os.Stdout
+		} else {
+			r, w, err := os.Pipe()
+			if err != nil {
+				if feedW != nil {
+					feedW.Close()
+				}
+				cleanup()
+				return "", err
+			}
+			cmd.Stdout = w
+			outR, outW = r, w
+		}
+
+		if err := cmd.Start(); err != nil {
+			if feedW != nil {
+				feedW.Close()
+			}
+			if outR != nil {
+				outR.Close()
+			}
+			if outW != nil {
+				outW.Close()
+			}
+			cleanup()
+			return "Error while executing file.", err
+		}
+
+		if !cur.isFirst && !cur.fromBuiltin {
+			cur.pipeR.Close() // the child keeps its own dup'd copy
+		}
+		if outW != nil {
+			outW.Close() // same: the child owns the copy it inherited
+		}
+		if feedW != nil {
+			if cur.hasBuiltinOut {
+				io.WriteString(feedW, cur.builtinOut+"\n") // matches printLine's own trailing newline
+			}
+			feedW.Close() // signals EOF now that nothing more is coming
+		}
+
+		if isLast {
+			err := cmd.Wait()
+			cleanup()
+			if err != nil {
+				return "Error while executing file.", err
+			}
+			return "", nil
+		}
+
+		cmds = append(cmds, cmd)
+		cur = pipelinePending{pipeR: outR}
 	}
 
-	right := exec.Command(rightArgs[0], rightArgs[1:]...)
-	right.Stdin = r
-	right.Stdout = os.Stdout
-	right.Stderr = os.Stderr
-
-	if err := right.Start(); err != nil {
-		r.Close()
-		w.Close()
-		return "Error while executing file.", err
-	}
-	r.Close() // the child keeps its own dup'd copy
-
-	if hasOutput {
-		io.WriteString(w, leftOutput+"\n") // matches printLine's own trailing newline
-	}
-	w.Close() // signals EOF now that nothing more is coming
-
-	if err := right.Wait(); err != nil {
-		return "Error while executing file.", err
-	}
-	return "", nil
-}
-
-// pipelineExternalToBuiltin runs leftArgs as an external command and, once
-// it finishes, runs rightArgs in-process. leftArgs' stdout is drained
-// through an OS pipe into io.Discard concurrently with it running — see
-// handlePipeline's doc comment for why discarding, not connecting it to the
-// builtin, is correct — which also prevents a chatty producer (e.g. ls on a
-// large directory) from blocking once the pipe's OS buffer fills.
-func pipelineExternalToBuiltin(leftArgs, rightArgs []string) (string, error) {
-	if _, err := exec.LookPath(leftArgs[0]); errors.Is(err, exec.ErrNotFound) {
-		return fmt.Sprintf("%s: command not found", leftArgs[0]), err
-	} else if err != nil {
-		return "Error while visiting file", err
-	}
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		return "", err
-	}
-
-	left := exec.Command(leftArgs[0], leftArgs[1:]...)
-	left.Stdin = os.Stdin
-	left.Stdout = w
-	left.Stderr = os.Stderr
-
-	if err := left.Start(); err != nil {
-		r.Close()
-		w.Close()
-		return "Error while executing file.", err
-	}
-	w.Close() // the child keeps its own dup'd copy
-
-	drained := make(chan struct{})
-	go func() {
-		io.Copy(io.Discard, r)
-		close(drained)
-	}()
-
-	left.Wait() // a failing producer is not a pipeline-level error, same as pipelineExternalToExternal
-	<-drained
-	r.Close()
-
-	return "", printBuiltinInPipeline(rightArgs)
-}
-
-// pipelineExternalToExternal connects leftArgs' standard output to
-// rightArgs' standard input through an OS pipe, running both as external
-// commands concurrently (Start, not Run, on each) so streaming data — e.g.
-// tail -f — reaches the second command as it arrives rather than only once
-// the first command exits. leftArgs inherits the shell's stdin; both
-// commands inherit the shell's stderr; rightArgs' stdout goes to the
-// shell's stdout.
-func pipelineExternalToExternal(leftArgs, rightArgs []string) (string, error) {
-	if _, err := exec.LookPath(leftArgs[0]); errors.Is(err, exec.ErrNotFound) {
-		return fmt.Sprintf("%s: command not found", leftArgs[0]), err
-	} else if err != nil {
-		return "Error while visiting file", err
-	}
-
-	if _, err := exec.LookPath(rightArgs[0]); errors.Is(err, exec.ErrNotFound) {
-		return fmt.Sprintf("%s: command not found", rightArgs[0]), err
-	} else if err != nil {
-		return "Error while visiting file", err
-	}
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		return "", err
-	}
-
-	left := exec.Command(leftArgs[0], leftArgs[1:]...)
-	left.Stdin = os.Stdin
-	left.Stdout = w
-	left.Stderr = os.Stderr
-
-	right := exec.Command(rightArgs[0], rightArgs[1:]...)
-	right.Stdin = r
-	right.Stdout = os.Stdout
-	right.Stderr = os.Stderr
-
-	if err := left.Start(); err != nil {
-		r.Close()
-		w.Close()
-		return "Error while executing file.", err
-	}
-	if err := right.Start(); err != nil {
-		w.Close()
-		r.Close()
-		left.Wait()
-		return "Error while executing file.", err
-	}
-
-	// The parent's own copies must close right after Start(): the child
-	// processes keep their own dup'd handles, and until every write-end
-	// copy is closed, the reader never sees EOF (or, for a stalled writer
-	// like tail -f, it never sees its pipe's read side go away either).
-	w.Close()
-	r.Close()
-
-	left.Wait() // exit status of a pipeline is the last command's; a producer killed by SIGPIPE once its reader exits is expected, not a shell-level error
-
-	if err := right.Wait(); err != nil {
-		return "Error while executing file.", err
-	}
-
-	return "", nil
+	return "", nil // unreachable: the loop above always returns on its last iteration
 }

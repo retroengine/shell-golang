@@ -53,14 +53,14 @@ func main() {
 			continue
 		}
 
-		leftArgs, rightArgs, isPipeline, pipeErr := splitPipeline(args)
+		stages, isPipeline, pipeErr := splitPipelineStages(args)
 
 		if isPipeline {
 			if pipeErr != nil {
 				printLine(pipeErr.Error())
 				continue
 			}
-			msg, err := handlePipeline(leftArgs, rightArgs)
+			msg, err := handlePipelineStages(stages)
 			if err != nil {
 				printLine(err.Error())
 			} else if msg != "" {

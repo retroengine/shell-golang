@@ -713,10 +713,58 @@ func TestE2E_PromptIsPrinted(t *testing.T) {
 // quoted executable names
 // ============================================================
 
-func TestE2E_QuotedExecutable(t *testing.T) {
-	catPath, err := exec.LookPath("cat")
+// buildFileCatScript compiles a tiny standalone program that reads the file
+// named by its first argument and copies its content to stdout — the same
+// observable contract as "cat <file>", but self-contained rather than
+// borrowed from the system. Tests that need to copy an executable under an
+// unusual name (to prove the shell can find and run it, not to test cat
+// itself) must not copy the system's own cat to do it: on this environment
+// cat is a uutils-coreutils multi-call binary that refuses to run under a
+// name it doesn't recognise as one of its own utilities (basename must end
+// in a known name — "xcat" runs fine, "custom_executable" or "exe with
+// 'single quotes'" gets "coreutils: unknown program ..." and exits 1), so
+// copying the real system binary to an arbitrary name silently breaks.
+func buildFileCatScript(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"io"
+	"os"
+)
+
+func main() {
+	f, err := os.Open(os.Args[1])
 	if err != nil {
-		t.Skip("cat is not on PATH in this environment")
+		os.Exit(1)
+	}
+	defer f.Close()
+	io.Copy(os.Stdout, f)
+}
+`
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write file-cat script source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "filecat")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build file-cat script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+func TestE2E_QuotedExecutable(t *testing.T) {
+	fileCatData, err := os.ReadFile(filepath.FromSlash(buildFileCatScript(t)))
+	if err != nil {
+		t.Fatalf("setup: cannot read file-cat script: %v", err)
 	}
 
 	binary := buildTestBinary(t)
@@ -740,11 +788,7 @@ func TestE2E_QuotedExecutable(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			dst += ".exe"
 		}
-		data, err := os.ReadFile(catPath)
-		if err != nil {
-			t.Fatalf("setup: cannot read cat binary: %v", err)
-		}
-		if err := os.WriteFile(dst, data, 0o755); err != nil {
+		if err := os.WriteFile(dst, fileCatData, 0o755); err != nil {
 			t.Fatalf("setup: cannot write %q: %v", dst, err)
 		}
 	}
@@ -1093,9 +1137,9 @@ func TestE2E_TabAutocomplete_NoMatch(t *testing.T) {
 // ============================================================
 
 func TestE2E_TabAutocomplete_Executable(t *testing.T) {
-	catPath, err := exec.LookPath("cat")
+	fileCatData, err := os.ReadFile(filepath.FromSlash(buildFileCatScript(t)))
 	if err != nil {
-		t.Skip("cat is not on PATH in this environment")
+		t.Fatalf("setup: cannot read file-cat script: %v", err)
 	}
 
 	binary := buildTestBinary(t)
@@ -1109,11 +1153,7 @@ func TestE2E_TabAutocomplete_Executable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		exePath += ".exe"
 	}
-	data, err := os.ReadFile(catPath)
-	if err != nil {
-		t.Fatalf("setup: cannot read cat binary: %v", err)
-	}
-	if err := os.WriteFile(exePath, data, 0o755); err != nil {
+	if err := os.WriteFile(exePath, fileCatData, 0o755); err != nil {
 		t.Fatalf("setup: cannot write %q: %v", exePath, err)
 	}
 
@@ -1142,9 +1182,8 @@ func TestE2E_TabAutocomplete_Executable(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Prepend the test directories to the real PATH rather than
-			// replacing it: the copied cat binary is an MSYS/Git-Bash build
-			// on Windows and needs its runtime DLL, which lives in a
-			// directory the real PATH already provides.
+			// replacing it, so anything else the shell or its child needs
+			// to resolve from the real environment is still reachable.
 			t.Setenv("PATH", tt.path+string(os.PathListSeparator)+os.Getenv("PATH"))
 			session := fmt.Sprintf("custom\t'%s'\n", file)
 			got := runShell(t, binary, session)
@@ -2480,6 +2519,141 @@ func TestE2E_Pipeline_Basic(t *testing.T) {
 			session: fmt.Sprintf("cat '%s' | wc\n", file),
 			want:    []string{"4", "8"},
 			why:     "spec: 'A pipeline connects the standard output of one command to the standard input of the next command using the | operator' — example: '$ cat /tmp/foo/file | wc'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			for _, want := range tt.want {
+				assertContainsWhy(t, tt.session, got, want, tt.why)
+			}
+		})
+	}
+}
+
+// ============================================================
+// pipelines with three or more stages
+// ============================================================
+
+func TestE2E_Pipeline_MultiStage(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("head"); err != nil {
+		t.Skip("head is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("tail"); err != nil {
+		t.Skip("tail is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("wc"); err != nil {
+		t.Skip("wc is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("ls"); err != nil {
+		t.Skip("ls is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("grep"); err != nil {
+		t.Skip("grep is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+
+	dir1 := filepath.ToSlash(t.TempDir())
+	file := dir1 + "/pipeline_multistage_input.txt"
+	// 5 lines; head -n 3 must actually truncate to the first 3 (3 lines, 6
+	// words) before wc ever sees it, proving the truncation from stage 2
+	// reaches stage 3 rather than the full file passing straight through.
+	content := "red fox\nblue jay\ngreen frog\nyellow bee\npurple owl\n"
+	if err := os.WriteFile(filepath.FromSlash(file), []byte(content), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	// ls -la on an empty directory containing exactly these 6 files prints,
+	// in order: "total N", ".", "..", then the 6 names sorted alphabetically
+	// — 9 lines total. tail -n 5 keeps the last 5 (everything from
+	// bbb_file2.txt on); head -n 3 of that keeps bbb_file2.txt,
+	// ccc_other.txt, ddd_file3.txt; grep "file" then keeps only the two
+	// whose name contains "file", dropping ccc_other.txt — so a pipeline
+	// that only passed data straight through, or dropped the wrong window,
+	// would show a different pair (or all six) instead.
+	dir2 := filepath.ToSlash(t.TempDir())
+	for _, name := range []string{"aaa_file1.txt", "bbb_file2.txt", "ccc_other.txt", "ddd_file3.txt", "eee_other2.txt", "fff_file4.txt"} {
+		if err := os.WriteFile(filepath.FromSlash(dir2+"/"+name), nil, 0o644); err != nil {
+			t.Fatalf("setup: cannot create %q: %v", dir2+"/"+name, err)
+		}
+	}
+
+	tests := []struct {
+		name        string
+		session     string
+		wantContain []string
+		wantAbsent  []string
+		why         string
+	}{
+		{
+			name:        "three stages: cat | head -n 3 | wc",
+			session:     fmt.Sprintf("cat '%s' | head -n 3 | wc\n", file),
+			wantContain: []string{"3", "6"},
+			why:         "spec example: '$ cat /tmp/foo/file | head -n 3 | wc' → '3 3 10' (3 lines, 6 words counted here since char count is platform-dependent, matching TestE2E_Pipeline_Basic's own convention)",
+		},
+		{
+			name:        "four stages: ls -la | tail -n 5 | head -n 3 | grep \"file\"",
+			session:     fmt.Sprintf("ls -la '%s' | tail -n 5 | head -n 3 | grep \"file\"\n", dir2),
+			wantContain: []string{"bbb_file2.txt", "ddd_file3.txt"},
+			wantAbsent:  []string{"aaa_file1.txt", "ccc_other.txt", "eee_other2.txt", "fff_file4.txt"},
+			why:         `spec example: '$ ls -la /tmp/foo | tail -n 5 | head -n 3 | grep "file"' — only the entries inside the tail/head window whose name matches "file" survive to the final stage`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			for _, want := range tt.wantContain {
+				assertContainsWhy(t, tt.session, got, want, tt.why)
+			}
+			for _, absent := range tt.wantAbsent {
+				wantEqual(t, typedSession(tt.session), fmt.Sprintf("%v", strings.Contains(got, absent)), "false", tt.why)
+			}
+		})
+	}
+}
+
+// TestE2E_Pipeline_MultiStage_Builtin confirms that a longer chain still
+// handles a builtin correctly wherever it sits, not just as one side of
+// exactly two stages — extending TestE2E_Pipeline_Builtins the same way
+// TestE2E_Pipeline_MultiStage extends TestE2E_Pipeline_Basic.
+func TestE2E_Pipeline_MultiStage_Builtin(t *testing.T) {
+	if _, err := exec.LookPath("wc"); err != nil {
+		t.Skip("wc is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	file := dir + "/pipeline_multistage_builtin_input.txt"
+	if err := os.WriteFile(filepath.FromSlash(file), []byte("unused\n"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	tests := []struct {
+		name    string
+		session string
+		want    []string
+		why     string
+	}{
+		{
+			name:    "builtin producer feeds two external stages",
+			session: "type echo | cat | wc\n",
+			want:    []string{"1", "5", "24"},
+			why:     "built-in commands must be handled correctly wherever they appear in a pipeline — a producer builtin followed by two external stages, not just one",
+		},
+		{
+			name:    "builtin in the middle of an external-builtin-external-shaped chain",
+			session: fmt.Sprintf("cat '%s' | type exit | cat\n", file),
+			want:    []string{"exit is a shell builtin"},
+			why:     "a builtin mid-chain still discards its predecessor's output and its own result still reaches the final stage",
 		},
 	}
 

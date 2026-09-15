@@ -3547,3 +3547,331 @@ func TestHandlePipeline_Builtins_MustFail(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================
+// splitPipelineStages
+// ============================================================
+
+func TestSplitPipelineStages_Valid(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantStages [][]string
+		why        string
+	}{
+		{
+			name:       "three commands, two pipes",
+			args:       []string{"cat", "file", "|", "head", "-n", "3", "|", "wc"},
+			wantStages: [][]string{{"cat", "file"}, {"head", "-n", "3"}, {"wc"}},
+			why:        "spec example: '$ cat /tmp/foo/file | head -n 3 | wc'",
+		},
+		{
+			name:       "four commands, three pipes",
+			args:       []string{"ls", "-la", "/tmp/foo", "|", "tail", "-n", "5", "|", "head", "-n", "3", "|", "grep", "file"},
+			wantStages: [][]string{{"ls", "-la", "/tmp/foo"}, {"tail", "-n", "5"}, {"head", "-n", "3"}, {"grep", "file"}},
+			why:        `spec example: '$ ls -la /tmp/foo | tail -n 5 | head -n 3 | grep "file"'`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			gotStages, isPipeline, err := splitPipelineStages(tt.args)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, fmt.Sprintf("%v", isPipeline), "true", tt.why)
+			wantEqual(t, call, fmt.Sprintf("%d", len(gotStages)), fmt.Sprintf("%d", len(tt.wantStages)), tt.why)
+			for si := range tt.wantStages {
+				if si < len(gotStages) {
+					wantArgs(t, call, gotStages[si], tt.wantStages[si], tt.why)
+				}
+			}
+		})
+	}
+}
+
+func TestSplitPipelineStages_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		why  string
+	}{
+		{
+			name: "no pipe token present",
+			args: []string{"echo", "hi"},
+			why:  "a command line with no | must be left untouched for normal (non-pipeline) dispatch",
+		},
+		{
+			name: "empty args",
+			args: []string{},
+			why:  "nothing to split; must not panic on an empty slice",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			gotStages, isPipeline, err := splitPipelineStages(tt.args)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, fmt.Sprintf("%v", isPipeline), "false", tt.why)
+			wantEqual(t, call, fmt.Sprintf("%d", len(gotStages)), "0", tt.why)
+		})
+	}
+}
+
+func TestSplitPipelineStages_MustFail(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantContain string
+		why         string
+	}{
+		{
+			name:        "leading pipe with no first command",
+			args:        []string{"|", "wc", "|", "head"},
+			wantContain: "syntax error",
+			why:         "a pipe must have a command on both sides, however many stages there are",
+		},
+		{
+			name:        "trailing pipe with no last command",
+			args:        []string{"cat", "|", "wc", "|"},
+			wantContain: "syntax error",
+			why:         "a pipe must have a command on both sides, however many stages there are",
+		},
+		{
+			name:        "two pipes back to back, an empty middle stage",
+			args:        []string{"cat", "|", "|", "wc"},
+			wantContain: "syntax error",
+			why:         "every stage between two pipes must be non-empty, not just the outermost two",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			_, isPipeline, err := splitPipelineStages(tt.args)
+
+			wantEqual(t, call, fmt.Sprintf("%v", isPipeline), "true", tt.why)
+			mustErr(t, call, err, tt.why)
+			wantErrContains(t, call, err, tt.wantContain, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handlePipelineStages
+// ============================================================
+
+// stagesCall renders a chain of stages the same way a 2-stage call label
+// already does ("left | right"), just for however many stages there are.
+func stagesCall(stages [][]string) string {
+	parts := make([]string, len(stages))
+	for i, s := range stages {
+		parts[i] = cmdLine(s)
+	}
+	return strings.Join(parts, " | ")
+}
+
+// runHandlePipelineStagesCapturingStdout is runHandlePipelineCapturingStdout's
+// N-stage counterpart, needed for the same reason: a builtin stage's own
+// output is written via printLine straight to os.Stdout, not returned as msg.
+func runHandlePipelineStagesCapturingStdout(t *testing.T, stages [][]string) (msg string, err error, stdout string) {
+	t.Helper()
+
+	r, w, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("setup: cannot create pipe: %v", perr)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+
+	msg, err = handlePipelineStages(stages)
+	w.Close()
+	os.Stdout = origStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+
+	return msg, err, buf.String()
+}
+
+func TestHandlePipelineStages_Valid(t *testing.T) {
+	tests := []struct {
+		name        string
+		stagesFn    func(t *testing.T) [][]string
+		wantContain []string
+		wantAbsent  []string
+		why         string
+	}{
+		{
+			name: "an intermediate stage actually filters what reaches the final stage",
+			stagesFn: func(t *testing.T) [][]string {
+				producer := buildCompleterScript(t, "alpha\nbeta\ngamma\ndelta", 0)
+				return [][]string{{producer}, {buildLineHeadScript(t, 2)}, {buildCatScript(t)}}
+			},
+			wantContain: []string{"alpha", "beta"},
+			wantAbsent:  []string{"gamma", "delta"},
+			why:         "spec example: 'cat /tmp/foo/file | head -n 3 | wc' — head's truncation must actually reach whatever comes after it, not just pass everything through",
+		},
+		{
+			name: "four external stages: two extra passthrough hops still deliver the filtered content",
+			stagesFn: func(t *testing.T) [][]string {
+				producer := buildCompleterScript(t, "one\ntwo\nthree\nfour", 0)
+				return [][]string{{producer}, {buildLineHeadScript(t, 2)}, {buildCatScript(t)}, {buildCatScript(t)}}
+			},
+			wantContain: []string{"one", "two"},
+			wantAbsent:  []string{"three", "four"},
+			why:         `spec example: 'ls -la /tmp/foo | tail -n 5 | head -n 3 | grep "file"' — four stages, not just two`,
+		},
+		{
+			name: "a builtin at the start of a longer chain",
+			stagesFn: func(t *testing.T) [][]string {
+				return [][]string{{"type", "echo"}, {buildCatScript(t)}, {buildCatScript(t)}}
+			},
+			wantContain: []string{"echo is a shell builtin"},
+			why:         "built-ins must work wherever they appear in a chain of three or more stages, not just as one side of exactly two",
+		},
+		{
+			name: "a builtin in the middle of a longer chain discards what arrives before it",
+			stagesFn: func(t *testing.T) [][]string {
+				producer := buildCompleterScript(t, "should_not_appear", 0)
+				return [][]string{{producer}, {"type", "cd"}, {buildCatScript(t)}}
+			},
+			wantContain: []string{"cd is a shell builtin"},
+			wantAbsent:  []string{"should_not_appear"},
+			why:         "a builtin never reads its predecessor's output, whatever position it sits at in a longer chain",
+		},
+		{
+			name: "a builtin at the very end of a longer chain",
+			stagesFn: func(t *testing.T) [][]string {
+				producer := buildCompleterScript(t, "should_not_appear_either", 0)
+				return [][]string{{producer}, {buildCatScript(t)}, {"type", "exit"}}
+			},
+			wantContain: []string{"exit is a shell builtin"},
+			wantAbsent:  []string{"should_not_appear_either"},
+			why:         `spec example: '$ ls | type exit' extended by one extra external hop before the final builtin`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stages := tt.stagesFn(t)
+			call := stagesCall(stages)
+
+			msg, err, stdout := runHandlePipelineStagesCapturingStdout(t, stages)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, "", tt.why)
+			for _, want := range tt.wantContain {
+				wantContains(t, call, stdout, want, tt.why)
+			}
+			for _, absent := range tt.wantAbsent {
+				wantEqual(t, call, fmt.Sprintf("%v", strings.Contains(stdout, absent)), "false", tt.why)
+			}
+		})
+	}
+}
+
+func TestHandlePipelineStages_Edge(t *testing.T) {
+	t.Run("a failing external command in the middle of the chain does not fail the pipeline", func(t *testing.T) {
+		why := "the exit status of a pipeline is the last command's, matching normal shell pipeline semantics — a failing stage anywhere before the last does not fail the pipeline"
+		stages := [][]string{{"go", "definitely-not-a-subcommand"}, {buildCatScript(t)}, {buildCatScript(t)}}
+		call := stagesCall(stages)
+
+		msg, err, stdout := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustNoErr(t, call, err, why)
+		wantEqual(t, call, msg, "", why)
+		wantEqual(t, call, stdout, "", why)
+	})
+
+	t.Run("echo with no operands still sends a blank line through every later stage", func(t *testing.T) {
+		why := "echo always produces a line, even an empty one, and that line must survive however many passthrough stages follow it"
+		stages := [][]string{{"echo"}, {buildCatScript(t)}, {buildCatScript(t)}}
+		call := stagesCall(stages)
+
+		msg, err, stdout := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustNoErr(t, call, err, why)
+		wantEqual(t, call, msg, "", why)
+		wantEqual(t, call, stdout, "\n", why)
+	})
+
+	t.Run("a builtin failing partway through the chain reports its own error immediately but does not fail the pipeline", func(t *testing.T) {
+		dir := t.TempDir()
+		badPath := filepath.ToSlash(filepath.Join(dir, "does-not-exist"))
+		why := "matches the two-stage rule: a non-final builtin's own error is printed right away, the same as a failing external producer's would be"
+		stages := [][]string{{"cd", badPath}, {buildCatScript(t)}, {buildCatScript(t)}}
+		call := stagesCall(stages)
+
+		msg, err, stdout := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustNoErr(t, call, err, why)
+		wantEqual(t, call, msg, "", why)
+		wantContains(t, call, stdout, "No such directory", why)
+	})
+}
+
+func TestHandlePipelineStages_MustFail(t *testing.T) {
+	t.Run("first command not on PATH in a three-stage chain", func(t *testing.T) {
+		why := "every external stage is checked against PATH, not just the last one"
+		stages := [][]string{{"nosuchcmd12345"}, {buildCatScript(t)}, {buildCatScript(t)}}
+		call := stagesCall(stages)
+
+		msg, err, _ := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustErr(t, call, err, why)
+		wantEqual(t, call, msg, "nosuchcmd12345: command not found", why)
+	})
+
+	t.Run("last command not on PATH in a three-stage chain", func(t *testing.T) {
+		why := "every external stage is checked against PATH, including the last one"
+		producer := buildCompleterScript(t, "unused", 0)
+		stages := [][]string{{producer}, {buildCatScript(t)}, {"nosuchcmd12345"}}
+		call := stagesCall(stages)
+
+		msg, err, _ := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustErr(t, call, err, why)
+		wantEqual(t, call, msg, "nosuchcmd12345: command not found", why)
+	})
+
+	t.Run("a builtin failing as the final stage of a longer chain fails the pipeline", func(t *testing.T) {
+		dir := t.TempDir()
+		badPath := filepath.ToSlash(filepath.Join(dir, "does-not-exist"))
+		why := "the same last-stage-owns-the-error rule applies at the end of a longer chain, not just a two-stage one"
+		stages := [][]string{{"echo", "unused"}, {buildCatScript(t)}, {"cd", badPath}}
+		call := stagesCall(stages)
+
+		msg, err, _ := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustErr(t, call, err, why)
+		wantEqual(t, call, msg, "", why)
+		wantErrContains(t, call, err, "No such directory", why)
+	})
+
+	t.Run("a bad command later in the chain is caught before any earlier producer runs", func(t *testing.T) {
+		why := "every stage is validated against PATH before any stage executes, so a cd producer earlier in the chain must not change the working directory when a later stage turns out to be unresolvable"
+		original, wdErr := os.Getwd()
+		if wdErr != nil {
+			t.Fatalf("setup: cannot read working directory: %v", wdErr)
+		}
+		t.Cleanup(func() { os.Chdir(original) })
+
+		target := t.TempDir()
+		stages := [][]string{{"cd", target}, {"nosuchcmd12345"}, {buildCatScript(t)}}
+		call := stagesCall(stages)
+
+		msg, err, _ := runHandlePipelineStagesCapturingStdout(t, stages)
+
+		mustErr(t, call, err, why)
+		wantEqual(t, call, msg, "nosuchcmd12345: command not found", why)
+
+		after, wdErr := os.Getwd()
+		if wdErr != nil {
+			t.Fatalf("cannot read working directory after the call: %v", wdErr)
+		}
+		wantSameDir(t, call, after, original, why)
+	})
+}
