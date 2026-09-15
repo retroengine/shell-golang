@@ -27,6 +27,8 @@ func main() {
 			continue
 		}
 
+		recordHistory(args)
+
 		cmdArgs, redirectTarget, redirErr , mode := extractRedirect(args)
 
 		if redirErr != nil {
@@ -144,6 +146,13 @@ func main() {
 
 			if jobsStr != "" {
 				printLine(jobsStr)
+			}
+
+		case "history":
+			historyStr := handleHistory(args)
+
+			if historyStr != "" {
+				printLine(historyStr)
 			}
 
 		default: // not a builtin: resolve and run as an external program

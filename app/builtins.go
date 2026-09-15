@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -22,6 +23,7 @@ var builtinNames = map[string]string{
 	"cd":       "change directory",
 	"complete": "registers autocompletion for given word",
 	"jobs":     "to identify the bg task and more",
+	"history":  "show previously executed commands",
 }
 
 // handleEcho joins everything after the command name with single spaces (args[0] is "echo" itself).
@@ -298,4 +300,107 @@ func reapCompletedJobs() {
 	for _, line := range reapAndFormat(false) {
 		printLine(line)
 	}
+}
+
+// historyList records every non-empty command line the shell has dispatched,
+// in the order it was executed — including builtins, external commands (even
+// ones that failed to run), and the history invocation itself.
+var historyList []string
+
+// recordHistory appends the raw dispatched tokens, rejoined with single
+// spaces, to historyList. Called once per non-empty input line before
+// redirect/pipeline/background parsing strips anything from args.
+func recordHistory(args []string) {
+	if len(args) == 0 {
+		return
+	}
+	historyList = append(historyList, strings.Join(args, " "))
+}
+
+// handleHistory formats historyList as a numbered list ("%5d  %s" per line,
+// joined with newlines), matching bash's history builtin output. With no
+// args it lists every entry; args[1], if present, limits the listing to
+// the last n entries (bash semantics: "last n", not zsh's "starting from
+// line n") while each entry keeps its true original 1-based index into
+// historyList — only the loop's starting point moves, never the index
+// printed for a given line.
+//
+// args[1] == "-r" and args[1] == "-w" are different modes entirely: "-r"
+// reads history from a file at args[2] and appends it to historyList; "-w"
+// writes every entry currently in historyList to args[2], one per line
+// with a trailing newline, creating the file if needed and overwriting it
+// otherwise (matching real bash). Both print nothing of their own (the
+// spec's examples show no output between the -r/-w invocation and the next
+// prompt).
+//
+// A non-numeric or negative n isn't specified by the task, and falls back
+// to showing everything (handleHistory must stay error-free and total for
+// any input, per its existing callers/tests). n=0 does follow real bash:
+// "the last zero commands" is an empty listing, not "everything" — so it
+// is handled by the same len(historyList)-n arithmetic as any other n,
+// clamped at 0 rather than special-cased.
+func handleHistory(args []string) string {
+	if len(args) > 1 {
+		switch args[1] {
+		case "-r":
+			if len(args) > 2 {
+				appendHistoryFromFile(args[2])
+			}
+			return ""
+		case "-w":
+			if len(args) > 2 {
+				writeHistoryToFile(args[2])
+			}
+			return ""
+		}
+	}
+
+	start := 0
+	if len(args) > 1 {
+		if n, err := strconv.Atoi(args[1]); err == nil && n >= 0 {
+			start = len(historyList) - n
+			if start < 0 {
+				start = 0
+			}
+		}
+	}
+
+	lines := make([]string, 0, len(historyList)-start)
+	for i := start; i < len(historyList); i++ {
+		lines = append(lines, fmt.Sprintf("%5d  %s", i+1, historyList[i]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// appendHistoryFromFile reads path and appends each of its non-empty lines
+// (trailing \r stripped, for files written on Windows) to historyList, in
+// file order, after whatever is already recorded. A missing or unreadable
+// file is silently ignored — handleHistory must stay error-free for any
+// input, matching its existing callers/tests.
+func appendHistoryFromFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line != "" {
+			historyList = append(historyList, line)
+		}
+	}
+}
+
+// writeHistoryToFile writes every entry in historyList to path, one per
+// line, with a trailing newline — creating the file if it doesn't exist
+// and truncating it if it does (matching real bash's history -w, which
+// overwrites the target rather than appending to it). Write failures are
+// silently ignored — handleHistory must stay error-free for any input,
+// matching its existing callers/tests.
+func writeHistoryToFile(path string) {
+	var b strings.Builder
+	for _, cmd := range historyList {
+		b.WriteString(cmd)
+		b.WriteByte('\n')
+	}
+	_ = os.WriteFile(path, []byte(b.String()), 0644)
 }

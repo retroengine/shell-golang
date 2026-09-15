@@ -179,6 +179,9 @@ func readLine(reader *bufio.Reader) (string, error) {
 	var cycleMatches []string // ambiguous matches currently being cycled through, once the list has been shown
 	cycleIndex := 0
 
+	historyPos := len(historyList) // browse position into historyList while walking through it with Up/Down; == len(historyList) means "not browsing" — input is the live-typed line
+	var savedInput []byte          // what was typed before browsing started, restored once Down walks back past the newest entry
+
 	for {
 		b, err := reader.ReadByte()
 		if err != nil {
@@ -195,9 +198,38 @@ func readLine(reader *bufio.Reader) (string, error) {
 		case 127, 8: // Backspace
 			consecutiveTabs = 0
 			cycleMatches = nil
+			historyPos = len(historyList) // editing the line exits history browsing; the next Up starts over from the newest entry
 			if len(input) > 0 {
 				input = input[:len(input)-1]
 			}
+
+		case 27: // ESC: possible start of an arrow-key escape sequence (CSI: ESC '[' <letter> — 'A' up, 'B' down, 'C' right, 'D' left)
+			next, err := reader.ReadByte()
+			if err != nil || next != '[' {
+				break // not a CSI sequence (or stdin closed mid-sequence): drop the ESC, leave input untouched
+			}
+			final, err := reader.ReadByte()
+			if err != nil {
+				break // sequence cut off before its final byte: drop it, leave input untouched
+			}
+			switch {
+			case final == 'A' && historyPos > 0: // Up arrow: walk one further back into history with each consecutive press
+				if historyPos == len(historyList) { // first Up from the live line: remember what was typed, to restore it if Down walks back past the newest entry
+					savedInput = append([]byte(nil), input...)
+				}
+				historyPos--
+				input = []byte(historyList[historyPos])
+
+			case final == 'B' && historyPos < len(historyList): // Down arrow: walk one entry forward, back toward the live line
+				historyPos++
+				if historyPos == len(historyList) {
+					input = append([]byte(nil), savedInput...)
+				} else {
+					input = []byte(historyList[historyPos])
+				}
+			}
+			// 'C'/'D' (right/left) and any other final byte: recognized-but-unimplemented CSI
+			// sequences, consumed here so they can't fall through to default and corrupt input.
 
 		case '\t':
 
@@ -373,6 +405,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 		default: // ordinary character
 			consecutiveTabs = 0
 			cycleMatches = nil
+			historyPos = len(historyList) // typing exits history browsing; the next Up starts over from the newest entry
 			input = append(input, b)
 		}
 

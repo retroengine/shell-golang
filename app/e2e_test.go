@@ -2964,3 +2964,240 @@ func TestE2E_Pipeline_Builtins_ProducerOutputHidden(t *testing.T) {
 	assertContainsWhy(t, session, got, "exit is a shell builtin", why)
 	wantEqual(t, typedSession(session), fmt.Sprintf("%v", strings.Contains(got, marker)), "false", why)
 }
+
+// ============================================================
+// history
+// ============================================================
+
+func TestE2E_Type_History(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	session := "type history\n"
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, "history is a shell builtin", "spec: 'type history' must report 'history is a shell builtin'")
+}
+
+func TestE2E_History(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "lists executed commands, numbered from 1, including invalid commands and history itself",
+			session: "echo hello\necho world\ninvalid_command\nhistory\n",
+			want:    "    1  echo hello\n    2  echo world\n    3  invalid_command\n    4  history",
+			why:     "spec: history must list every previously executed command in order, numbered from 1, and must include the history invocation itself (the tester expects this even though shells like zsh omit it)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// history <n>
+// ============================================================
+
+func TestE2E_HistoryLimit(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "history <n> shows only the last n entries, keeping each entry's true original index",
+			session: "echo first\necho second\nhistory 2\n",
+			want:    "    2  echo second\n    3  history 2",
+			why:     "spec confirmed example: after 'echo first', 'echo second', 'history 2' must print the last 2 of 3 entries ('echo second' and 'history 2') at their true original indices 2 and 3, not renumbered from 1",
+		},
+		{
+			name:    "history <n> with n >= len(historyList) shows everything, no error",
+			session: "echo first\necho second\nhistory 10\n",
+			want:    "    1  echo first\n    2  echo second\n    3  history 10",
+			why:     "spec: 'the last n commands' — asking for more than exist shows everything available, without erroring",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// up-arrow history recall
+// ============================================================
+
+// No real PTY exists in this harness (session strings are piped, not a
+// terminal), so the inline "redrawn prompt" text readLine would echo on a
+// real terminal is not observable here — that redraw is gated behind
+// isTerm, which is false for a piped stdin. What IS observable: readLine's
+// byte-handling loop (including the ESC/CSI case) runs identically whether
+// or not stdin is a terminal, so a session can embed the literal 3-byte
+// Up-arrow sequence ("\x1b[A"), let it recall a command into the input
+// buffer, then press Enter to run it — and the recalled command's
+// distinctive output proves which entry was actually recalled.
+func TestE2E_HistoryUpArrow(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name      string
+		session   string
+		substr    string
+		wantCount int
+		why       string
+	}{
+		{
+			name:      "one Up arrow recalls and re-runs the most recently executed command",
+			session:   "echo hello\necho world\n\x1b[A\n",
+			substr:    "world",
+			wantCount: 2,
+			why:       "spec transcript: after 'echo hello'/'echo world' have run, one UP ARROW recalls the most recent entry ('echo world'); running it again makes its output appear a second time",
+		},
+		{
+			name:      "one Up arrow does not walk back past the most recent entry",
+			session:   "echo hello\necho world\n\x1b[A\n",
+			substr:    "hello",
+			wantCount: 1,
+			why:       "spec transcript: a single UP ARROW after 'echo hello'/'echo world' recalls only 'echo world', not 'echo hello' — 'hello' must still appear exactly once, from its original run",
+		},
+		{
+			name:      "a second Up arrow, pressed again before Enter, walks one further back",
+			session:   "echo hello\necho world\n\x1b[A\x1b[A\n",
+			substr:    "hello",
+			wantCount: 2,
+			why:       "spec transcript: 'a second UP ARROW' immediately after, with no Enter in between, walks one further back to 'echo hello'; running it again makes its output appear a second time",
+		},
+		{
+			name:      "the second Up arrow moves off the most recent entry, not repeating it",
+			session:   "echo hello\necho world\n\x1b[A\x1b[A\n",
+			substr:    "world",
+			wantCount: 1,
+			why:       "spec transcript: the second UP ARROW recalls 'echo hello', not 'echo world' again — 'world' must still appear exactly once, from its original run",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			call := typedSession(tt.session)
+			wantEqual(t, call, fmt.Sprintf("%d", strings.Count(got, tt.substr)), fmt.Sprintf("%d", tt.wantCount), tt.why)
+		})
+	}
+}
+
+func TestE2E_HistoryDownArrow(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name      string
+		session   string
+		substr    string
+		wantCount int
+		why       string
+	}{
+		{
+			name:      "after walking back two entries with Up, one Down arrow walks forward and recalls the more recent one",
+			session:   "echo hello\necho world\n\x1b[A\x1b[A\x1b[B\n",
+			substr:    "world",
+			wantCount: 2,
+			why:       "spec transcript: UP ARROW, UP ARROW lands on 'echo hello'; DOWN ARROW then moves forward to 'echo world' — running it again makes its output appear a second time",
+		},
+		{
+			name:      "the Down arrow moves off the oldest entry, not staying on it",
+			session:   "echo hello\necho world\n\x1b[A\x1b[A\x1b[B\n",
+			substr:    "hello",
+			wantCount: 1,
+			why:       "spec transcript: after UP, UP, DOWN the recalled entry is 'echo world', not 'echo hello' — 'hello' must still appear exactly once, from its original run",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			call := typedSession(tt.session)
+			wantEqual(t, call, fmt.Sprintf("%d", strings.Count(got, tt.substr)), fmt.Sprintf("%d", tt.wantCount), tt.why)
+		})
+	}
+}
+
+// TestE2E_HistoryUpDownArrow_EnterExecutes exercises the exact transcript
+// from the "press enter to execute a recalled command" stage: UP, UP, DOWN
+// recalls "echo world", and pressing Enter must run it (not just display
+// it) — proven by its output reappearing — while leaving the shell in a
+// normal, working state for whatever is typed next.
+func TestE2E_HistoryUpDownArrow_EnterExecutes(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	session := "echo hello\necho world\n\x1b[A\x1b[A\x1b[B\necho done\n"
+	why := "spec transcript: after UP, UP, DOWN recalls 'echo world', pressing ENTER executes it (its output 'world' appears again) and the shell keeps working normally afterward"
+
+	got := runShell(t, binary, session)
+	call := typedSession(session)
+
+	wantEqual(t, call, fmt.Sprintf("%d", strings.Count(got, "world")), "2", why)
+	assertContainsWhy(t, session, got, "done", why)
+}
+
+// ============================================================
+// history -r <path>
+// ============================================================
+
+func TestE2E_HistoryReadFile(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	dir := filepath.ToSlash(t.TempDir())
+	historyFile := dir + "/history_file"
+	if err := os.WriteFile(filepath.FromSlash(historyFile), []byte("echo hello\necho world\n\n"), 0644); err != nil {
+		t.Fatalf("setup: cannot write history file: %v", err)
+	}
+
+	session := fmt.Sprintf("history -r '%s'\nhistory\n", historyFile)
+	// The recorded "history -r ..." entry has no quotes: historyList reconstructs
+	// entries by rejoining already-tokenized args, and the shell's own tokenizer
+	// strips quote delimiters (they only protected the path from word-splitting).
+	want := fmt.Sprintf("    1  history -r %s\n    2  echo hello\n    3  echo world\n    4  history", historyFile)
+	why := "spec confirmed example: 'history -r <path>' is itself recorded (index 1), its file's non-empty lines are appended (echo hello, echo world at indices 2-3), and the next history call (index 4) shows all of it"
+
+	got := runShell(t, binary, session)
+	assertContainsWhy(t, session, got, want, why)
+}
+
+// ============================================================
+// history -w <path>
+// ============================================================
+
+func TestE2E_HistoryWriteFile(t *testing.T) {
+	binary := buildTestBinary(t)
+
+	dir := filepath.ToSlash(t.TempDir())
+	historyFile := dir + "/history_file"
+
+	session := fmt.Sprintf("echo hello\necho world\nhistory -w '%s'\n", historyFile)
+	why := "spec confirmed example: after 'echo hello'/'echo world', history -w writes every recorded entry — including the history -w invocation itself — to the file, one per line, with a trailing newline"
+
+	runShell(t, binary, session)
+
+	got, err := os.ReadFile(filepath.FromSlash(historyFile))
+	mustNoErr(t, typedSession(session), err, why)
+
+	// The written "history -w ..." line has no quotes, for the same reason
+	// TestE2E_HistoryReadFile's recorded entry doesn't: historyList holds
+	// already-tokenized args rejoined, and the shell's tokenizer strips the
+	// quote delimiters that only protected the path from word-splitting.
+	want := fmt.Sprintf("echo hello\necho world\nhistory -w %s\n", historyFile)
+	wantEqual(t, typedSession(session), string(got), want, why)
+}

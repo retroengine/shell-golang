@@ -3875,3 +3875,272 @@ func TestHandlePipelineStages_MustFail(t *testing.T) {
 		wantSameDir(t, call, after, original, why)
 	})
 }
+
+// ============================================================
+// history
+// ============================================================
+
+func TestHandleHistory_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		cmds []string
+		want string
+		why  string
+	}{
+		{
+			name: "lists previously recorded commands, numbered from 1",
+			cmds: []string{"echo hello", "echo world", "invalid_command"},
+			want: "    1  echo hello\n    2  echo world\n    3  invalid_command",
+			why:  "spec: history lists previously executed commands as '    1  previous_command_1' — right-justified index, two spaces, then the command",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origHistoryList := historyList
+			historyList = append([]string(nil), tt.cmds...)
+			defer func() { historyList = origHistoryList }()
+
+			call := "history"
+			got := handleHistory([]string{"history"})
+
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleHistory_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "no commands recorded yet",
+			why:  "spec: history lists previously executed commands — with none recorded, there is nothing to list",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origHistoryList := historyList
+			historyList = nil
+			defer func() { historyList = origHistoryList }()
+
+			wantEqual(t, "history", handleHistory(nil), "", tt.why)
+		})
+	}
+}
+
+func TestHandleHistory_NeverErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "nil args", args: nil},
+		{name: "empty args", args: []string{}},
+		{name: "extra args history does not use", args: []string{"history", "10"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			// handleHistory has no error return; this just proves it returns cleanly regardless of args content.
+			_ = handleHistory(tt.args)
+			t.Logf("%s %s\n    expected: no panic\n    received: no panic", markPass, call)
+		})
+	}
+}
+
+func TestHandleTYPE_RecognizesHistory(t *testing.T) {
+	call := cmdLine([]string{"type", "history"})
+	got, err := handleTYPE([]string{"type", "history"}, builtinNames)
+
+	mustNoErr(t, call, err, "spec: 'type history' must report 'history is a shell builtin'")
+	wantEqual(t, call, got, "history is a shell builtin", "spec: 'type history' must report 'history is a shell builtin'")
+}
+
+func TestHandleHistory_Limit(t *testing.T) {
+	tests := []struct {
+		name string
+		cmds []string
+		args []string
+		want string
+		why  string
+	}{
+		{
+			name: "n smaller than history length shows only the last n entries, original indices kept",
+			cmds: []string{"echo first", "echo second", "history 2"},
+			args: []string{"history", "2"},
+			want: "    2  echo second\n    3  history 2",
+			why:  "spec confirmed example: 'history 2' after 'echo first'/'echo second' shows the last 2 of 3 entries, keeping each entry's true original 1-based index (2 and 3), not renumbered from 1",
+		},
+		{
+			name: "n equal to history length shows everything",
+			cmds: []string{"echo first", "echo second", "echo third"},
+			args: []string{"history", "3"},
+			want: "    1  echo first\n    2  echo second\n    3  echo third",
+			why:  "spec: 'history <n> ... shows the last n commands' — asking for exactly as many as exist shows all of them",
+		},
+		{
+			name: "n greater than history length shows everything, no error",
+			cmds: []string{"echo first", "echo second"},
+			args: []string{"history", "10"},
+			want: "    1  echo first\n    2  echo second",
+			why:  "spec: 'the last n commands' — asking for more than exist shows everything available, without erroring",
+		},
+		{
+			name: "n of 0 shows nothing",
+			cmds: []string{"echo first", "echo second"},
+			args: []string{"history", "0"},
+			want: "",
+			why:  "Bash interpretation of history <n> ('the last n commands'), which the spec explicitly says to follow: the last zero commands is an empty listing",
+		},
+		{
+			name: "negative n falls back to showing everything",
+			cmds: []string{"echo first", "echo second"},
+			args: []string{"history", "-1"},
+			want: "    1  echo first\n    2  echo second",
+			why:  "spec leaves negative n undefined; handleHistory must never error, so an unusable limit falls back to the same behavior as no limit at all",
+		},
+		{
+			name: "non-numeric n falls back to showing everything",
+			cmds: []string{"echo first", "echo second"},
+			args: []string{"history", "abc"},
+			want: "    1  echo first\n    2  echo second",
+			why:  "spec: non-numeric n isn't specified; handleHistory must never error, so an unparseable limit falls back to showing everything",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origHistoryList := historyList
+			historyList = append([]string(nil), tt.cmds...)
+			defer func() { historyList = origHistoryList }()
+
+			call := cmdLine(tt.args)
+			got := handleHistory(tt.args)
+
+			wantEqual(t, call, got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleHistory_ReadFile_Valid(t *testing.T) {
+	tests := []struct {
+		name        string
+		fileContent string
+		preCmds     []string
+		want        string
+		why         string
+	}{
+		{
+			name:        "reading a history file appends its non-empty lines to the history list",
+			fileContent: "echo hello\necho world\n\n",
+			want:        "    1  echo hello\n    2  echo world",
+			why:         "spec: 'history -r should append the history file's contents to the history list in memory' — each non-empty line becomes a new entry",
+		},
+		{
+			name:        "reading a history file appends after whatever is already recorded, not replacing it",
+			fileContent: "echo hello\necho world\n",
+			preCmds:     []string{"pwd"},
+			want:        "    1  pwd\n    2  echo hello\n    3  echo world",
+			why:         "spec: 'history -r should append the history file's contents to the history list in memory' — existing entries are kept, new ones added after them",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origHistoryList := historyList
+			historyList = append([]string(nil), tt.preCmds...)
+			defer func() { historyList = origHistoryList }()
+
+			path := filepath.Join(t.TempDir(), "history_file")
+			if err := os.WriteFile(path, []byte(tt.fileContent), 0644); err != nil {
+				t.Fatalf("setup: cannot write history file: %v", err)
+			}
+
+			call := cmdLine([]string{"history", "-r", path})
+			readOutput := handleHistory([]string{"history", "-r", path})
+			wantEqual(t, call, readOutput, "", "history -r prints nothing of its own, per the spec's example transcript")
+
+			got := handleHistory([]string{"history"})
+			wantEqual(t, "history", got, tt.want, tt.why)
+		})
+	}
+}
+
+func TestHandleHistory_ReadFile_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "a missing history file is silently ignored",
+			why:  "handleHistory must never error (established by TestHandleHistory_NeverErrors); an unreadable -r file has no entries to append, so nothing changes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origHistoryList := historyList
+			historyList = nil
+			defer func() { historyList = origHistoryList }()
+
+			path := filepath.Join(t.TempDir(), "does_not_exist")
+			call := cmdLine([]string{"history", "-r", path})
+
+			readOutput := handleHistory([]string{"history", "-r", path})
+			wantEqual(t, call, readOutput, "", tt.why)
+
+			got := handleHistory([]string{"history"})
+			wantEqual(t, "history", got, "", tt.why)
+		})
+	}
+}
+
+func TestHandleHistory_WriteFile_Valid(t *testing.T) {
+	tests := []struct {
+		name           string
+		preCmds        []string
+		preFileContent string
+		want           string
+		why            string
+	}{
+		{
+			name:    "writing history to a new file writes every entry, one per line, with a trailing newline",
+			preCmds: []string{"echo hello", "echo world"},
+			want:    "echo hello\necho world\n",
+			why:     "spec confirmed example: after 'echo hello', 'echo world', history -w writes both lines to the file, terminated by a trailing newline (the empty line at the end); 'if the file doesn't exist ... create the file and then write the commands to it'",
+		},
+		{
+			name:           "history -w truncates and replaces any existing content in the file",
+			preCmds:        []string{"pwd"},
+			preFileContent: "some stale content that should be gone\n",
+			want:           "pwd\n",
+			why:            "bash's history -w overwrites the target file rather than appending to old content",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origHistoryList := historyList
+			historyList = append([]string(nil), tt.preCmds...)
+			defer func() { historyList = origHistoryList }()
+
+			path := filepath.Join(t.TempDir(), "history_file")
+			if tt.preFileContent != "" {
+				if err := os.WriteFile(path, []byte(tt.preFileContent), 0644); err != nil {
+					t.Fatalf("setup: cannot pre-write history file: %v", err)
+				}
+			}
+
+			call := cmdLine([]string{"history", "-w", path})
+			writeOutput := handleHistory([]string{"history", "-w", path})
+			wantEqual(t, call, writeOutput, "", "history -w prints nothing of its own")
+
+			got, err := os.ReadFile(path)
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, string(got), tt.want, tt.why)
+		})
+	}
+}
