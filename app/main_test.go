@@ -3105,3 +3105,445 @@ func TestReapCompletedJobs_Edge_NothingToReap(t *testing.T) {
 	wantEqual(t, "reapCompletedJobs", buf.String(), "",
 		"spec: with no jobs (or nothing completed), reaping before the prompt prints nothing")
 }
+
+// ============================================================
+// splitPipeline
+// ============================================================
+
+func TestSplitPipeline_Valid(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantLeft  []string
+		wantRight []string
+		why       string
+	}{
+		{
+			name:      "two simple commands",
+			args:      []string{"cat", "file.txt", "|", "wc"},
+			wantLeft:  []string{"cat", "file.txt"},
+			wantRight: []string{"wc"},
+			why:       "spec: 'A pipeline connects the standard output of one command to the standard input of the next command using the | operator'",
+		},
+		{
+			name:      "multi-arg commands on both sides",
+			args:      []string{"tail", "-f", "file", "|", "head", "-n", "5"},
+			wantLeft:  []string{"tail", "-f", "file"},
+			wantRight: []string{"head", "-n", "5"},
+			why:       "spec example: 'tail -f /tmp/foo/file-1 | head -n 5'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			gotLeft, gotRight, isPipeline, err := splitPipeline(tt.args)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, fmt.Sprintf("%v", isPipeline), "true", tt.why)
+			wantArgs(t, call, gotLeft, tt.wantLeft, tt.why)
+			wantArgs(t, call, gotRight, tt.wantRight, tt.why)
+		})
+	}
+}
+
+func TestSplitPipeline_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		why  string
+	}{
+		{
+			name: "no pipe token present",
+			args: []string{"echo", "hi"},
+			why:  "a command line with no | must be left untouched for normal (non-pipeline) dispatch",
+		},
+		{
+			name: "empty args",
+			args: []string{},
+			why:  "nothing to split; must not panic on an empty slice",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			gotLeft, gotRight, isPipeline, err := splitPipeline(tt.args)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, fmt.Sprintf("%v", isPipeline), "false", tt.why)
+			wantArgs(t, call, gotLeft, nil, tt.why)
+			wantArgs(t, call, gotRight, nil, tt.why)
+		})
+	}
+}
+
+func TestSplitPipeline_MustFail(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantContain string
+		why         string
+	}{
+		{
+			name:        "leading pipe with no left command",
+			args:        []string{"|", "wc"},
+			wantContain: "syntax error",
+			why:         "a pipe must have a command on both sides",
+		},
+		{
+			name:        "trailing pipe with no right command",
+			args:        []string{"cat", "|"},
+			wantContain: "syntax error",
+			why:         "a pipe must have a command on both sides",
+		},
+		{
+			name:        "two pipes / three commands",
+			args:        []string{"cat", "|", "wc", "|", "head"},
+			wantContain: "syntax error",
+			why:         "spec: 'implement support for basic pipelines involving two external commands' — this stage is scoped to exactly two commands",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := cmdLine(tt.args)
+			_, _, isPipeline, err := splitPipeline(tt.args)
+
+			wantEqual(t, call, fmt.Sprintf("%v", isPipeline), "true", tt.why)
+			mustErr(t, call, err, tt.why)
+			wantErrContains(t, call, err, tt.wantContain, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handlePipeline
+// ============================================================
+
+func TestHandlePipeline_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "left command's stdout reaches right command's stdin, which reaches the shell's stdout",
+			why:  "spec: 'A pipeline connects the standard output of one command to the standard input of the next command using the | operator'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			producer := buildCompleterScript(t, "handlepipeline_marker", 0)
+			passthrough := buildCatScript(t)
+			leftArgs := []string{producer}
+			rightArgs := []string{passthrough}
+			call := cmdLine(leftArgs) + " | " + cmdLine(rightArgs)
+
+			r, w, perr := os.Pipe()
+			if perr != nil {
+				t.Fatalf("setup: cannot create pipe: %v", perr)
+			}
+			origStdout := os.Stdout
+			os.Stdout = w
+
+			msg, err := handlePipeline(leftArgs, rightArgs)
+			w.Close()
+			os.Stdout = origStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, "", tt.why)
+			wantContains(t, call, buf.String(), "handlepipeline_marker", tt.why)
+		})
+	}
+}
+
+func TestHandlePipeline_Edge(t *testing.T) {
+	tests := []struct {
+		name string
+		why  string
+	}{
+		{
+			name: "left command exits non-zero but right command still succeeds",
+			why:  "the exit status of a pipeline is the last command's, matching normal shell pipeline semantics — a failing producer does not fail the pipeline",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			passthrough := buildCatScript(t)
+			leftArgs := []string{"go", "definitely-not-a-subcommand"}
+			rightArgs := []string{passthrough}
+			call := cmdLine(leftArgs) + " | " + cmdLine(rightArgs)
+
+			r, w, perr := os.Pipe()
+			if perr != nil {
+				t.Fatalf("setup: cannot create pipe: %v", perr)
+			}
+			origStdout := os.Stdout
+			os.Stdout = w
+
+			msg, err := handlePipeline(leftArgs, rightArgs)
+			w.Close()
+			os.Stdout = origStdout
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, "", tt.why)
+		})
+	}
+}
+
+func TestHandlePipeline_MustFail(t *testing.T) {
+	tests := []struct {
+		name    string
+		leftFn  func(t *testing.T) []string
+		rightFn func(t *testing.T) []string
+		wantMsg string
+		why     string
+	}{
+		{
+			name:    "left command is not on PATH",
+			leftFn:  func(t *testing.T) []string { return []string{"nosuchcmd12345"} },
+			rightFn: func(t *testing.T) []string { return []string{buildCatScript(t)} },
+			wantMsg: "nosuchcmd12345: command not found",
+			why:     "LookPath is checked before anything is started, same convention as handleExecFile",
+		},
+		{
+			name:    "right command is not on PATH",
+			leftFn:  func(t *testing.T) []string { return []string{buildCompleterScript(t, "unused", 0)} },
+			rightFn: func(t *testing.T) []string { return []string{"nosuchcmd12345"} },
+			wantMsg: "nosuchcmd12345: command not found",
+			why:     "both sides of the pipe must be resolvable, not just the first",
+		},
+		{
+			name:    "right command exists but exits non-zero",
+			leftFn:  func(t *testing.T) []string { return []string{buildCompleterScript(t, "unused", 0)} },
+			rightFn: func(t *testing.T) []string { return []string{"go", "definitely-not-a-subcommand"} },
+			wantMsg: "Error while executing file.",
+			why:     "matches handleExecFile's existing non-zero-exit convention",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftArgs := tt.leftFn(t)
+			rightArgs := tt.rightFn(t)
+			call := cmdLine(leftArgs) + " | " + cmdLine(rightArgs)
+
+			msg, err := handlePipeline(leftArgs, rightArgs)
+
+			mustErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, tt.wantMsg, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// handlePipeline — builtins as part of a pipeline
+// ============================================================
+
+// runHandlePipelineCapturingStdout calls handlePipeline with os.Stdout
+// swapped for a pipe, the same technique TestHandlePipeline_Valid/_Edge use
+// above — needed here because a builtin's own output (unlike an external
+// command's) is written via printLine straight to os.Stdout rather than
+// returned as msg.
+func runHandlePipelineCapturingStdout(t *testing.T, leftArgs, rightArgs []string) (msg string, err error, stdout string) {
+	t.Helper()
+
+	r, w, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("setup: cannot create pipe: %v", perr)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+
+	msg, err = handlePipeline(leftArgs, rightArgs)
+	w.Close()
+	os.Stdout = origStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+
+	return msg, err, buf.String()
+}
+
+func TestHandlePipeline_Builtins_Valid(t *testing.T) {
+	tests := []struct {
+		name       string
+		leftFn     func(t *testing.T) []string
+		rightFn    func(t *testing.T) []string
+		wantStdout string
+		why        string
+	}{
+		{
+			name:       "builtin producer feeds an external consumer",
+			leftFn:     func(t *testing.T) []string { return []string{"echo", "apple-orange"} },
+			rightFn:    func(t *testing.T) []string { return []string{buildCatScript(t)} },
+			wantStdout: "apple-orange\n",
+			why:        "spec example: '$ echo apple-orange | wc' — a builtin's output must reach the next command's stdin like any producer's would",
+		},
+		{
+			name:       "external producer feeds a builtin consumer; the producer's own output is not printed",
+			leftFn:     func(t *testing.T) []string { return []string{buildCompleterScript(t, "should_not_appear", 0)} },
+			rightFn:    func(t *testing.T) []string { return []string{"type", "exit"} },
+			wantStdout: "exit is a shell builtin\n",
+			why:        "spec example: '$ ls | type exit' — 'the ls output is not supposed to be printed', only type's own result reaches the terminal",
+		},
+		{
+			name:       "builtin producer feeds a builtin consumer",
+			leftFn:     func(t *testing.T) []string { return []string{"echo", "discarded"} },
+			rightFn:    func(t *testing.T) []string { return []string{"type", "cd"} },
+			wantStdout: "cd is a shell builtin\n",
+			why:        "neither builtin reads stdin, so the left side's output is dropped the same way it would be piping into any real command that ignores stdin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftArgs := tt.leftFn(t)
+			rightArgs := tt.rightFn(t)
+			call := cmdLine(leftArgs) + " | " + cmdLine(rightArgs)
+
+			msg, err, stdout := runHandlePipelineCapturingStdout(t, leftArgs, rightArgs)
+
+			mustNoErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, "", tt.why)
+			wantEqual(t, call, stdout, tt.wantStdout, tt.why)
+		})
+	}
+}
+
+func TestHandlePipeline_Builtins_Edge(t *testing.T) {
+	tests := []struct {
+		name    string
+		leftFn  func(t *testing.T) []string
+		rightFn func(t *testing.T) []string
+		check   func(t *testing.T, call string, leftArgs []string, msg string, err error, stdout string, why string)
+		why     string
+	}{
+		{
+			name:    "echo with no operands still sends a blank line",
+			leftFn:  func(t *testing.T) []string { return []string{"echo"} },
+			rightFn: func(t *testing.T) []string { return []string{buildCatScript(t)} },
+			why:     "main's own echo dispatch prints unconditionally, even an empty result — a pipeline producer must match it, not silently drop the blank line",
+			check: func(t *testing.T, call string, leftArgs []string, msg string, err error, stdout string, why string) {
+				mustNoErr(t, call, err, why)
+				wantEqual(t, call, msg, "", why)
+				wantEqual(t, call, stdout, "\n", why)
+			},
+		},
+		{
+			name: "cd success as a producer sends nothing at all",
+			leftFn: func(t *testing.T) []string {
+				original, err := os.Getwd()
+				if err != nil {
+					t.Fatalf("setup: cannot get working directory: %v", err)
+				}
+				t.Cleanup(func() { os.Chdir(original) }) // cd for real changes the process's cwd; restore it so later tests (e.g. go build in another subtest's buildCatScript) aren't left inside a directory t.TempDir() has already removed
+				return []string{"cd", t.TempDir()}
+			},
+			rightFn: func(t *testing.T) []string { return []string{buildCatScript(t)} },
+			why:     "cd has no stdout on success, unlike echo — an empty result here must not become a blank line",
+			check: func(t *testing.T, call string, leftArgs []string, msg string, err error, stdout string, why string) {
+				mustNoErr(t, call, err, why)
+				wantEqual(t, call, msg, "", why)
+				wantEqual(t, call, stdout, "", why)
+			},
+		},
+		{
+			name: "cd failing as a producer does not fail the pipeline",
+			leftFn: func(t *testing.T) []string {
+				return []string{"cd", filepath.Join(t.TempDir(), "does-not-exist")}
+			},
+			rightFn: func(t *testing.T) []string { return []string{buildCatScript(t)} },
+			why:     "spec: 'the exit status of a pipeline is the last command's' — a failing producer, builtin or not, must not fail the pipeline; its own error is surfaced but the right side still runs",
+			check: func(t *testing.T, call string, leftArgs []string, msg string, err error, stdout string, why string) {
+				mustNoErr(t, call, err, why)
+				wantEqual(t, call, msg, "", why)
+				wantContains(t, call, stdout, fmt.Sprintf("cd: %s: No such directory", leftArgs[1]), why)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftArgs := tt.leftFn(t)
+			rightArgs := tt.rightFn(t)
+			call := cmdLine(leftArgs) + " | " + cmdLine(rightArgs)
+
+			msg, err, stdout := runHandlePipelineCapturingStdout(t, leftArgs, rightArgs)
+
+			tt.check(t, call, leftArgs, msg, err, stdout, tt.why)
+		})
+	}
+}
+
+func TestHandlePipeline_Builtins_MustFail(t *testing.T) {
+	tests := []struct {
+		name           string
+		leftFn         func(t *testing.T) []string
+		rightFn        func(t *testing.T) []string
+		wantMsg        string
+		wantErrContain string
+		why            string
+	}{
+		{
+			name:    "builtin producer, external consumer not on PATH",
+			leftFn:  func(t *testing.T) []string { return []string{"echo", "hi"} },
+			rightFn: func(t *testing.T) []string { return []string{"nosuchcmd12345"} },
+			wantMsg: "nosuchcmd12345: command not found",
+			why:     "a builtin on one side doesn't exempt the other side from PATH resolution, same as when both sides are external",
+		},
+		{
+			name:    "external producer not on PATH, builtin consumer",
+			leftFn:  func(t *testing.T) []string { return []string{"nosuchcmd12345"} },
+			rightFn: func(t *testing.T) []string { return []string{"type", "echo"} },
+			wantMsg: "nosuchcmd12345: command not found",
+			why:     "the left side is still checked before the (in-process) right side ever runs",
+		},
+		{
+			name: "cd failing as the pipeline's final stage fails the pipeline",
+			leftFn: func(t *testing.T) []string {
+				return []string{buildCompleterScript(t, "unused", 0)}
+			},
+			rightFn: func(t *testing.T) []string {
+				return []string{"cd", filepath.Join(t.TempDir(), "does-not-exist")}
+			},
+			wantMsg:        "",
+			wantErrContain: "No such directory",
+			why:            "unlike a failing producer (see TestHandlePipeline_Builtins_Edge), a failing builtin that is the pipeline's last stage has nothing running after it to absorb the failure, so the builtin's own error becomes the pipeline's error",
+		},
+		{
+			name:   "cd failing as the final stage of an all-builtin pipeline",
+			leftFn: func(t *testing.T) []string { return []string{"echo", "unused"} },
+			rightFn: func(t *testing.T) []string {
+				return []string{"cd", filepath.Join(t.TempDir(), "does-not-exist")}
+			},
+			wantMsg:        "",
+			wantErrContain: "No such directory",
+			why:            "the same last-stage-owns-the-error rule applies whether the producer side is a builtin or external",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftArgs := tt.leftFn(t)
+			rightArgs := tt.rightFn(t)
+			call := cmdLine(leftArgs) + " | " + cmdLine(rightArgs)
+
+			msg, err := handlePipeline(leftArgs, rightArgs)
+
+			mustErr(t, call, err, tt.why)
+			wantEqual(t, call, msg, tt.wantMsg, tt.why)
+			if tt.wantErrContain != "" {
+				wantErrContains(t, call, err, tt.wantErrContain, tt.why)
+			}
+		})
+	}
+}

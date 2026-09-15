@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2355,4 +2357,436 @@ func assertContains(t *testing.T, typedIn, got, want string) {
 func assertContainsWhy(t *testing.T, typedIn, got, want, why string) {
 	t.Helper()
 	wantContains(t, typedSession(typedIn), got, want, why)
+}
+
+// buildCatScript compiles a tiny standalone program that copies stdin to
+// stdout verbatim — a minimal, dependency-free stand-in for the system
+// "cat" command, used as the downstream half of a pipeline in tests so they
+// don't depend on a real "cat" being on PATH.
+func buildCatScript(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"io"
+	"os"
+)
+
+func main() {
+	io.Copy(os.Stdout, os.Stdin)
+}
+`
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write cat script source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "catlike")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build cat script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// buildLineHeadScript compiles a tiny standalone program that prints the
+// first n lines read from stdin, one at a time, then exits — the same
+// observable contract as "head -n N". It exists because this environment's
+// real head (uutils coreutils) fully buffers its stdout until it exits,
+// regardless of whether the destination is a terminal or a pipe (confirmed
+// by piping a live "tail -f" into it directly, outside the shell: tail's
+// own output reaches the pipe immediately, but nothing from head appears
+// until it has already read all n lines). That buffering policy belongs to
+// head, not to the shell being tested, so using it downstream would
+// confound head's own behavior with whatever the shell's pipeline
+// implementation does. Go's fmt.Println already writes straight through
+// via an unbuffered os.File.Write, so this stand-in flushes every line the
+// instant it is read, isolating exactly the property the streaming test
+// cares about: whether the shell starts both commands concurrently.
+func buildLineHeadScript(t *testing.T, n int) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := fmt.Sprintf(`package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+)
+
+func main() {
+	scanner := bufio.NewScanner(os.Stdin)
+	for count := 0; count < %d && scanner.Scan(); count++ {
+		fmt.Println(scanner.Text())
+	}
+}
+`, n)
+
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
+		t.Fatalf("setup: cannot write line-head script source: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "linehead")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+
+	out, err := exec.Command("go", "build", "-o", binPath, srcPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup: cannot build line-head script: %v\n%s", err, out)
+	}
+	return filepath.ToSlash(binPath)
+}
+
+// ============================================================
+// pipelines (cmd1 | cmd2)
+// ============================================================
+
+func TestE2E_Pipeline_Basic(t *testing.T) {
+	if _, err := exec.LookPath("cat"); err != nil {
+		t.Skip("cat is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("wc"); err != nil {
+		t.Skip("wc is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	file := dir + "/pipeline_input.txt"
+
+	// 4 lines, 8 words — deliberately distinct counts so a passing
+	// assertion on each number can't be satisfied by the other by accident.
+	content := "red fox\nblue jay\ngreen frog\nyellow bee\n"
+	if err := os.WriteFile(filepath.FromSlash(file), []byte(content), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	tests := []struct {
+		name    string
+		session string
+		want    []string
+		why     string
+	}{
+		{
+			name:    "cat piped into wc reports line and word counts",
+			session: fmt.Sprintf("cat '%s' | wc\n", file),
+			want:    []string{"4", "8"},
+			why:     "spec: 'A pipeline connects the standard output of one command to the standard input of the next command using the | operator' — example: '$ cat /tmp/foo/file | wc'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			for _, want := range tt.want {
+				assertContainsWhy(t, tt.session, got, want, tt.why)
+			}
+		})
+	}
+}
+
+func TestE2E_Pipeline_MustFail(t *testing.T) {
+	if _, err := exec.LookPath("wc"); err != nil {
+		t.Skip("wc is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	file := dir + "/pipeline_fail_input.txt"
+	if err := os.WriteFile(filepath.FromSlash(file), []byte("content\n"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	tests := []struct {
+		name    string
+		session string
+		want    string
+		why     string
+	}{
+		{
+			name:    "left command not on PATH",
+			session: "nosuchcmd12345 | wc\n",
+			want:    "not found",
+			why:     "both halves of a pipeline are external commands resolved from PATH, same as any other command",
+		},
+		{
+			name:    "right command not on PATH",
+			session: fmt.Sprintf("cat '%s' | nosuchcmd12345\n", file),
+			want:    "not found",
+			why:     "both halves of a pipeline are external commands resolved from PATH, same as any other command",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			assertContainsWhy(t, tt.session, got, tt.want, tt.why)
+		})
+	}
+}
+
+// ============================================================
+// pipeline streaming — interactive shell test infrastructure
+//
+// The tail -f | head example requires appending to a file WHILE the
+// pipeline is still running (the shell is blocked inside a single
+// foreground command the whole time), which the static-session runShell
+// helper above cannot exercise: it feeds a whole session upfront and only
+// inspects output after the shell process has fully exited. interactiveShell
+// instead starts the shell with real, live stdin/stdout pipes so a test can
+// write to it and read from it while it is still executing.
+// ============================================================
+
+// interactiveShell wraps a live shell process. Output is drained into a
+// mutex-guarded buffer by a background goroutine rather than read line by
+// line: the "$ " prompt has no trailing newline, so a line-oriented scanner
+// would never flush it.
+type interactiveShell struct {
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	mu    sync.Mutex
+	buf   strings.Builder
+	done  chan struct{}
+}
+
+func startInteractiveShell(t *testing.T, binary string) *interactiveShell {
+	t.Helper()
+
+	cmd := exec.Command(binary)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("setup: cannot open shell stdin: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("setup: cannot open shell stdout: %v", err)
+	}
+	cmd.Stderr = nil // discard the EOF panic trace, same as runShell
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("setup: cannot start shell: %v", err)
+	}
+
+	sh := &interactiveShell{cmd: cmd, stdin: stdin, done: make(chan struct{})}
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := stdout.Read(buf)
+			if n > 0 {
+				sh.mu.Lock()
+				sh.buf.Write(buf[:n])
+				sh.mu.Unlock()
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		cmd.Wait()
+		close(sh.done)
+	}()
+
+	return sh
+}
+
+// send writes line plus a trailing newline to the shell's stdin, as if typed.
+func (sh *interactiveShell) send(t *testing.T, line string) {
+	t.Helper()
+	if _, err := io.WriteString(sh.stdin, line+"\n"); err != nil {
+		t.Fatalf("setup: cannot write to shell stdin: %v", err)
+	}
+}
+
+func (sh *interactiveShell) snapshot() string {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.buf.String()
+}
+
+// waitForOutput polls (rather than blocking on a channel) since output can
+// arrive as arbitrary byte chunks, not discrete messages; it returns true as
+// soon as want appears anywhere in everything read so far, or false once
+// timeout elapses.
+func (sh *interactiveShell) waitForOutput(want string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if strings.Contains(sh.snapshot(), want) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// close closes the shell's stdin (as EOF would) and waits for it to exit,
+// force-killing it if it doesn't — so a bug under test fails this test
+// instead of leaking a hung process into the rest of the suite.
+func (sh *interactiveShell) close(t *testing.T) {
+	t.Helper()
+	sh.stdin.Close()
+	select {
+	case <-sh.done:
+	case <-time.After(5 * time.Second):
+		sh.cmd.Process.Kill()
+		<-sh.done
+	}
+}
+
+func TestE2E_Pipeline_Streaming(t *testing.T) {
+	if _, err := exec.LookPath("tail"); err != nil {
+		t.Skip("tail is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "stream.txt")
+
+	initial := "raspberry strawberry\npear mango\npineapple apple\n"
+	if err := os.WriteFile(file, []byte(initial), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", file, err)
+	}
+
+	appendLine := func(s string) {
+		t.Helper()
+		f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatalf("setup: cannot append to %q: %v", file, err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString(s + "\n"); err != nil {
+			t.Fatalf("setup: cannot append to %q: %v", file, err)
+		}
+	}
+
+	sh := startInteractiveShell(t, binary)
+	defer sh.close(t)
+
+	// linehead stands in for "head -n 5" — see buildLineHeadScript for why
+	// this environment's real head can't be used to observe streaming.
+	linehead := buildLineHeadScript(t, 5)
+	session := fmt.Sprintf("tail -f '%s' | '%s'\n", filepath.ToSlash(file), linehead)
+	why := "spec: 'For the tail -f command, the tester will check if the running command keeps printing new lines' — appended lines must reach head while tail is still running (both commands started concurrently via Start, not one Run to completion before the next begins), not only after tail eventually exits"
+	sh.send(t, session)
+
+	for _, want := range []string{"raspberry strawberry", "pear mango", "pineapple apple"} {
+		if !sh.waitForOutput(want, 4*time.Second) {
+			t.Fatal(failLine(typedSession(session), "line containing "+show(want)+" (pre-existing file content)", "(timed out waiting)", why))
+		}
+	}
+
+	appendLine("This is line 4.")
+	if !sh.waitForOutput("This is line 4.", 4*time.Second) {
+		t.Fatal(failLine(typedSession(session), "\"This is line 4.\" appearing live after being appended mid-command", "(timed out waiting)", why))
+	}
+
+	appendLine("This is line 5.")
+	if !sh.waitForOutput("This is line 5.", 4*time.Second) {
+		t.Fatal(failLine(typedSession(session), "\"This is line 5.\" appearing live after being appended mid-command", "(timed out waiting)", why))
+	}
+
+	// head has now read its 5 lines and exited; tail only notices the
+	// closed pipe (SIGPIPE) on its own next write attempt, so one more
+	// append is needed to trigger that and let the pipeline — and the
+	// prompt — return.
+	appendLine("trigger line for pipe teardown")
+
+	terminationWhy := "spec: 'The tester will check if the final output matches the expected output after pipeline execution' — once head is satisfied, the whole pipeline (including tail) must terminate and control must return to the shell"
+	if !sh.waitForOutput("$", 4*time.Second) {
+		t.Fatal(failLine(typedSession(session), "prompt reappears once the pipeline terminates", "(timed out waiting)", terminationWhy))
+	}
+}
+
+// ============================================================
+// pipelines with builtins
+// ============================================================
+
+func TestE2E_Pipeline_Builtins(t *testing.T) {
+	if _, err := exec.LookPath("wc"); err != nil {
+		t.Skip("wc is not on PATH in this environment")
+	}
+	if _, err := exec.LookPath("ls"); err != nil {
+		t.Skip("ls is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+
+	tests := []struct {
+		name    string
+		session string
+		want    []string
+		why     string
+	}{
+		{
+			name:    "builtin at the beginning of a pipeline, piped into an external command",
+			session: "echo apple-orange | wc\n",
+			want:    []string{"1", "1", "13"},
+			why:     "spec example: '$ echo apple-orange | wc' reports 1 line, 1 word, 13 characters",
+		},
+		{
+			name:    "external command piped into a builtin at the end of a pipeline",
+			session: "ls | type exit\n",
+			want:    []string{"exit is a shell builtin"},
+			why:     "spec example: '$ ls | type exit' → 'exit is a shell builtin'",
+		},
+		{
+			name:    "another builtin at the beginning of a pipeline",
+			session: "type echo | wc\n",
+			want:    []string{"1", "5", "24"},
+			why:     "built-in commands need to be handled correctly wherever they appear in a pipeline, not just echo — here type is the producer",
+		},
+		{
+			name:    "a failing builtin at the end of a pipeline reports its own error",
+			session: "echo hi | cd definitely-not-a-real-subdirectory\n",
+			want:    []string{"No such directory"},
+			why:     "a builtin's own failure, when it is the pipeline's last stage, is the pipeline's result — same as any other command's failure would be",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runShell(t, binary, tt.session)
+			for _, want := range tt.want {
+				assertContainsWhy(t, tt.session, got, want, tt.why)
+			}
+		})
+	}
+}
+
+// TestE2E_Pipeline_Builtins_ProducerOutputHidden is split out from the table
+// above because, unlike a plain "does the output contain X" check, it also
+// has to prove a negative: ls's own listing must never reach the terminal
+// when type is what actually consumes the pipeline's result.
+func TestE2E_Pipeline_Builtins_ProducerOutputHidden(t *testing.T) {
+	if _, err := exec.LookPath("ls"); err != nil {
+		t.Skip("ls is not on PATH in this environment")
+	}
+
+	binary := buildTestBinary(t)
+	dir := filepath.ToSlash(t.TempDir())
+	marker := "pipeline_builtin_marker_file.txt"
+	markerPath := dir + "/" + marker
+	if err := os.WriteFile(filepath.FromSlash(markerPath), []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: cannot create %q: %v", markerPath, err)
+	}
+
+	session := fmt.Sprintf("cd '%s'\nls | type exit\n", dir)
+	why := "spec: '$ ls | type exit' example — 'the ls output is not supposed to be printed', only type's own result"
+
+	got := runShell(t, binary, session)
+
+	assertContainsWhy(t, session, got, "exit is a shell builtin", why)
+	wantEqual(t, typedSession(session), fmt.Sprintf("%v", strings.Contains(got, marker)), "false", why)
 }

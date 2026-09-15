@@ -9,20 +9,6 @@ import (
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
-	
-
-	builtInSet := map[string]string{ // keys are the recognised builtins; values are unused, only membership is checked (see handleTYPE)
-		"type": "get cmd type",
-		"echo": "print",
-		"exit": "exiting",
-		"pwd":  "get working directory",
-		"cd":   "change directory",
-		"complete": "registers autocompletion for given word",
-		"jobs":"to identify the bg task and more",
-	}
-
-
-
 	shellLoop: // labeled so "exit" below can break out of the for loop, not just its switch
 	for {
 
@@ -64,6 +50,22 @@ func main() {
 		}
 
 		if len(args) == 0 {
+			continue
+		}
+
+		leftArgs, rightArgs, isPipeline, pipeErr := splitPipeline(args)
+
+		if isPipeline {
+			if pipeErr != nil {
+				printLine(pipeErr.Error())
+				continue
+			}
+			msg, err := handlePipeline(leftArgs, rightArgs)
+			if err != nil {
+				printLine(err.Error())
+			} else if msg != "" {
+				printLine(msg)
+			}
 			continue
 		}
 
@@ -111,7 +113,7 @@ func main() {
 			}
 
 		case "type":
-			typeString, err := handleTYPE(args, builtInSet)
+			typeString, err := handleTYPE(args, builtinNames)
 			if err != nil {
 				if mode == 2 || mode == 4 { // stderr redirect requested
 					if werr := writeError(redirectTarget, err, mode); werr != nil {

@@ -10,6 +10,20 @@ import (
 	"strings"
 )
 
+// builtinNames is the set of recognised shell builtins — keys are the
+// builtin names, values unused (only membership is checked). It backs both
+// main's dispatch switch and handleTYPE, and lets pipeline.go recognise a
+// builtin appearing on either side of a "|" without hand-listing names again.
+var builtinNames = map[string]string{
+	"type":     "get cmd type",
+	"echo":     "print",
+	"exit":     "exiting",
+	"pwd":      "get working directory",
+	"cd":       "change directory",
+	"complete": "registers autocompletion for given word",
+	"jobs":     "to identify the bg task and more",
+}
+
 // handleEcho joins everything after the command name with single spaces (args[0] is "echo" itself).
 func handleEcho(args []string) (string, error) {
 	if len(args) == 0 {
